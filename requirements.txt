@@ -3,3 +3,4 @@ python-telegram-bot
 pandas
 yfinance
 python-dotenv
+google-generativeai
