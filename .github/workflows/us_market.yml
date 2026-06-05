@@ -20,7 +20,9 @@ jobs:
 
       - name: 필요한 패키지 설치
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install --force-reinstall google-genai
 
       - name: 구글 인증키 생성
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
