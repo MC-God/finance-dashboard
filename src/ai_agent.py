@@ -16,7 +16,6 @@ def analyze_portfolio(portfolio_data: str, persona: str) -> str:
     4가지 전문적인 페르소나에 맞춘 포트폴리오 심층 분석 의견을 생성합니다.
     """
     
-    # 1. 전문가 수준의 페르소나별 시스템 프롬프트 (System Instructions)
     prompts = {
         "quant": (
             "당신은 월스트리트 헤지펀드의 수석 퀀트(Quant) 애널리스트입니다. "
@@ -47,14 +46,13 @@ def analyze_portfolio(portfolio_data: str, persona: str) -> str:
     system_instruction = prompts.get(persona, "당신은 전문적인 금융 AI 애널리스트입니다.")
     
     try:
-        # Gemini 3.5 Flash 모델 호출 (구글 검색 도구 활성화)
         response = client.models.generate_content(
             model='gemini-3.5-flash',
             contents=f"다음은 오늘 장 마감 후의 내 포트폴리오 데이터야:\n{portfolio_data}\n\n이 데이터와 최신 검색 결과를 바탕으로 너의 페르소나에 맞춰 심층 분석 리포트를 작성해줘.",
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                temperature=0.4, # 검색 팩트 기반 분석을 위해 온도를 약간 낮춤 (0.7 -> 0.4)
-                tools=[{"google_search": {}}], # 구글 검색 연동 활성화
+                temperature=0.4, 
+                tools=[{"google_search": {}}], 
             )
         )
         return response.text
@@ -71,6 +69,7 @@ if __name__ == "__main__":
     
     personas = ["quant", "macro", "value", "ten_bagger"]
     
+    # 딜레이 없이 4명의 페르소나 연속 호출
     for p in personas:
         print(f"🤖 [{p.upper()} 의견 생성 중...]")
         opinion = analyze_portfolio(sample_portfolio, p)
