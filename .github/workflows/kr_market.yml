@@ -1,0 +1,32 @@
+name: KR Market Update
+
+on:
+  schedule:
+    # 한국 시간(KST) 오후 4:00 = UTC 오전 07:00 (월~금)
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch: # 수동 실행 버튼
+
+jobs:
+  update-kr-market:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 코드 가져오기
+        uses: actions/checkout@v3
+
+      - name: Python 환경 설정
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 필요한 패키지 설치
+        run: |
+          pip install -r requirements.txt
+
+      - name: 구글 인증키 생성 (Secret에서 복원)
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+
+      - name: 한국장 데이터 업데이트 (kr 모드)
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python batch_daily.py kr
