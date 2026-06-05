@@ -2,6 +2,6 @@ gspread
 python-dotenv
 pandas
 finance-datareader
-google-generativeai
+requests
 streamlit
 python-telegram-bot
