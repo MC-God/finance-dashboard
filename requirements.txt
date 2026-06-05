@@ -4,3 +4,5 @@ yfinance
 pandas
 python-dotenv
 finance-datareader
+streamlit
+python-telegram-bot
