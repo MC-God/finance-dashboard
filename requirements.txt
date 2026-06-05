@@ -1,8 +1,7 @@
 gspread
-google-auth
-yfinance
-pandas
 python-dotenv
+pandas
 finance-datareader
+google-genai
 streamlit
 python-telegram-bot
