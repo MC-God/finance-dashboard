@@ -3,3 +3,4 @@ google-auth
 yfinance
 pandas
 python-dotenv
+finance-datareader

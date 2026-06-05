@@ -1,10 +1,10 @@
 import yfinance as yf
 import pandas as pd
+import math
 
 def get_stock_info(ticker):
     """
     특정 종목의 현재가와 1일 변동률을 가져옵니다.
-    추후 1M, 1Y 수익률 및 거시 지표(환율/금리) 로직이 추가될 함수입니다.
     """
     try:
         stock = yf.Ticker(ticker)
@@ -14,9 +14,15 @@ def get_stock_info(ticker):
         if len(hist) < 2:
             return None
             
-        current_price = hist['Close'].iloc[-1]
-        prev_price = hist['Close'].iloc[-2]
+        # numpy 자료형을 파이썬 기본 float 형으로 강제 변환
+        current_price = float(hist['Close'].iloc[-1])
+        prev_price = float(hist['Close'].iloc[-2])
         
+        # yfinance가 NaN(결측치)을 반환할 경우 업데이트를 건너뛰도록 처리
+        if math.isnan(current_price) or math.isnan(prev_price):
+            print(f"⚠️ [{ticker}] 유효하지 않은 주가 데이터(NaN)가 감지되어 건너뜁니다.")
+            return None
+            
         # 1일 수익률 계산 (%)
         daily_return_pct = ((current_price - prev_price) / prev_price) * 100
         
@@ -31,7 +37,6 @@ def get_stock_info(ticker):
 
 # --- 테스트 실행 블록 ---
 if __name__ == "__main__":
-    # 개별 기술주 및 섹터 ETF 테스트
     test_tickers = ["NVDA", "SOXX"] 
     
     for t in test_tickers:
