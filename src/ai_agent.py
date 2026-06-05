@@ -12,37 +12,49 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 def analyze_portfolio(portfolio_data: str, persona: str) -> str:
     """
-    포트폴리오 데이터를 바탕으로 3가지 페르소나에 맞춘 분석 의견을 생성합니다.
+    최신 웹 검색(Google Search Grounding)을 활용하여
+    4가지 전문적인 페르소나에 맞춘 포트폴리오 심층 분석 의견을 생성합니다.
     """
-    # 페르소나별 시스템 프롬프트 정의
+    
+    # 1. 전문가 수준의 페르소나별 시스템 프롬프트 (System Instructions)
     prompts = {
         "quant": (
-            "당신은 데이터와 통계를 맹신하는 냉철한 퀀트 투자자입니다. "
-            "주어진 포트폴리오의 수익률, 변동성, 종목 비중의 리스크를 수치 기반으로 분석하고, "
-            "기계적인 비중 조절(리밸런싱) 조언을 3~4문장으로 짧게 제공하세요."
+            "당신은 월스트리트 헤지펀드의 수석 퀀트(Quant) 애널리스트입니다. "
+            "주어진 포트폴리오 데이터를 바탕으로 변동성, 모멘텀, 리스크 관리(MDD 최소화) 관점에서 분석하세요. "
+            "구글 검색을 통해 현재 시장의 전반적인 VIX(공포지수)나 주요 기술적 지표 동향을 파악한 뒤, "
+            "데이터에 기반한 냉철하고 기계적인 리밸런싱 및 비중 조절 전략을 4~5문장으로 제시하십시오."
         ),
         "macro": (
-            "당신은 글로벌 경제 흐름을 꿰뚫어보는 거시경제 전문가입니다. "
-            "주어진 데이터를 바탕으로 현재 시장 상황(특히 AI 인프라 등 기술주 및 매크로 환경)을 진단하고, "
-            "어떤 섹터로 자금을 이동시켜야 할지 탑다운(Top-down) 관점의 조언을 3~4문장으로 제공하세요."
+            "당신은 글로벌 매크로 헤지펀드의 포트폴리오 매니저입니다. "
+            "구글 검색을 통해 가장 최근의 금리 동향, 연준(Fed)의 스탠스, 주요 경제 지표(CPI, 고용 등) 및 환율 뉴스를 확인하세요. "
+            "이를 주어진 포트폴리오와 연결하여, 현재 거시 경제 환경에서 기술주나 특정 섹터가 받을 영향을 탑다운(Top-down) 관점에서 분석하고 "
+            "자산 배분 및 섹터 로테이션 전략을 4~5문장으로 제시하십시오."
         ),
         "value": (
-            "당신은 기업의 본질 가치를 믿는 워런 버핏 같은 가치투자자입니다. "
-            "단기적인 수익률 변동에 흔들리지 말고, 장기적 관점에서 기업의 펀더멘털을 믿고 "
-            "뚝심 있게 홀딩하거나 저가 매수할 기회가 있는지 3~4문장으로 조언하세요."
+            "당신은 잉여현금흐름(FCF)과 본질 가치를 중시하는 정통 딥밸류(Deep Value) 투자자입니다. "
+            "주어진 포트폴리오 내 종목들에 대해 구글 검색으로 최근 실적 발표, 가이던스, 또는 펀더멘털 관련 뉴스를 파악하세요. "
+            "단기적인 가격 변동률(1D Return)은 무시하고, 기업의 해자(Moat)와 안전마진(Margin of Safety) 관점에서 "
+            "현재 포지션을 유지할지, 추가 매수할 기회인지 4~5문장으로 무겁고 진중하게 조언하십시오."
+        ),
+        "ten_bagger": (
+            "당신은 파괴적 혁신과 패러다임 시프트를 쫓는 실리콘밸리의 벤처캐피탈리스트이자 텐베거(10-Bagger) 발굴 전문가입니다. "
+            "주어진 포트폴리오 종목(특히 AI 인프라, 차세대 반도체 등 핵심 기술주)과 관련해 "
+            "최근 기술적 브레이크스루, 폭발적인 TAM(총 접근 가능 시장) 확장, 또는 게임 체인저가 될 만한 최신 뉴스를 구글에서 검색하세요. "
+            "초과 수익(Alpha)을 달성하기 위한 공격적인 비중 확대나, 넥스트 빅띵(Next Big Thing)에 대한 통찰을 4~5문장으로 강렬하게 제시하십시오."
         )
     }
     
-    system_instruction = prompts.get(persona, "당신은 훌륭한 금융 AI 어시스턴트입니다.")
+    system_instruction = prompts.get(persona, "당신은 전문적인 금융 AI 애널리스트입니다.")
     
     try:
-        # Gemini 3.5 Flash 모델 호출
+        # Gemini 3.5 Flash 모델 호출 (구글 검색 도구 활성화)
         response = client.models.generate_content(
             model='gemini-3.5-flash',
-            contents=f"다음은 오늘 장 마감 후의 내 포트폴리오 데이터야:\n{portfolio_data}\n\n이 데이터를 바탕으로 너의 페르소나에 맞춰 조언을 해줘.",
+            contents=f"다음은 오늘 장 마감 후의 내 포트폴리오 데이터야:\n{portfolio_data}\n\n이 데이터와 최신 검색 결과를 바탕으로 너의 페르소나에 맞춰 심층 분석 리포트를 작성해줘.",
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                temperature=0.7, # 0에 가까울수록 일관성, 1에 가까울수록 창의성
+                temperature=0.4, # 검색 팩트 기반 분석을 위해 온도를 약간 낮춤 (0.7 -> 0.4)
+                tools=[{"google_search": {}}], # 구글 검색 연동 활성화
             )
         )
         return response.text
@@ -52,12 +64,14 @@ def analyze_portfolio(portfolio_data: str, persona: str) -> str:
 
 # --- 테스트 실행 블록 ---
 if __name__ == "__main__":
-    # Phase 1에서 수집한 데이터라고 가정 (가짜 데이터)
     sample_portfolio = """
-    Ticker: NVDA | Shares: 10 | Avg_Price: 120.0 | Current_Price: 125.0 | 1D_Return: +4.1%
-    Ticker: SOXX | Shares: 5 | Avg_Price: 200.0 | Current_Price: 198.0 | 1D_Return: -1.0%
+    Ticker: NVDA | Shares: 15 | Avg_Price: 110.0 | Current_Price: 125.0 | 1D_Return: +4.1%
+    Ticker: SOXX | Shares: 10 | Avg_Price: 195.0 | Current_Price: 198.0 | 1D_Return: -1.0%
     """
     
-    print("🤖 [Quant 의견]\n" + analyze_portfolio(sample_portfolio, "quant") + "\n")
-    print("🌍 [Macro 의견]\n" + analyze_portfolio(sample_portfolio, "macro") + "\n")
-    print("📈 [Value 의견]\n" + analyze_portfolio(sample_portfolio, "value") + "\n")
+    personas = ["quant", "macro", "value", "ten_bagger"]
+    
+    for p in personas:
+        print(f"🤖 [{p.upper()} 의견 생성 중...]")
+        opinion = analyze_portfolio(sample_portfolio, p)
+        print(opinion + "\n" + "-"*50 + "\n")

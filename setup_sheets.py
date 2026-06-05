@@ -18,12 +18,11 @@ def setup_google_sheets_template():
         print(f"❌ 시트를 열 수 없습니다. .env 파일의 SPREADSHEET_ID를 확인하세요: {e}")
         return
 
-    # 2. 시트별 헤더 스키마 정의
-    # Phase 4의 Transaction 시트까지 미리 정의해 둡니다.
+    # 2. 시트별 헤더 스키마 정의 (텐베거 의견 추가)
     templates = {
         "Portfolio": ["Ticker", "Shares", "Avg_Price", "Current_Price", "1D_Return"],
         "Transaction": ["Date", "Type", "Ticker", "Shares", "Price"],
-        "AI_Reports": ["Date", "Quant_Opinion", "Macro_Opinion", "Value_Opinion"]
+        "AI_Reports": ["Date", "Quant_Opinion", "Macro_Opinion", "Value_Opinion", "Ten_Bagger_Opinion"]
     }
 
     # 3. 각 시트 확인 및 템플릿 적용
@@ -38,23 +37,21 @@ def setup_google_sheets_template():
             print(f"✨ '{sheet_name}' 시트를 새로 생성했습니다.")
 
         # 1행(A1부터 시작)에 헤더 데이터 업데이트
-        # 최신 gspread 권장 문법 사용
         worksheet.update(values=[headers], range_name="A1")
         
         # 1행(헤더)을 굵은 글씨(Bold)로 포맷팅하여 가독성 향상
-        # 헤더의 길이에 맞춰 컬럼 알파벳 계산 (예: 5개면 E)
         end_col = chr(ord('A') + len(headers) - 1) 
         worksheet.format(f'A1:{end_col}1', {'textFormat': {'bold': True}})
         
-    # 기존에 기본으로 생성되어 있던 "시트1" (Sheet1)이 있다면 삭제 (깔끔하게 관리하기 위함)
+    # 기존에 기본으로 생성되어 있던 "시트1" (Sheet1)이 있다면 삭제
     try:
-        default_sheet = doc.worksheet("시트1") # 영문판일 경우 "Sheet1"
+        default_sheet = doc.worksheet("시트1") 
         doc.del_worksheet(default_sheet)
         print("🗑️ 불필요한 기본 시트('시트1')를 삭제했습니다.")
     except gspread.exceptions.WorksheetNotFound:
-        pass # "시트1"이 없으면 그냥 넘어감
+        pass 
     except Exception:
-        pass # 영문판 "Sheet1" 등 다른 이름일 경우 무시
+        pass 
 
     print("🎉 모든 구글 시트 템플릿 세팅이 성공적으로 완료되었습니다!")
 
