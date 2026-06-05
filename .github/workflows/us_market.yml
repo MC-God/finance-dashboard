@@ -20,12 +20,20 @@ jobs:
       - name: 구글 인증키 생성
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
 
-      - name: 🔒 가상 환경 세팅 및 패키지 깨끗하게 설치
+      - name: 🔒 구글 네임스페이스 충돌 강제 해결 및 패키지 설치
         run: |
           python -m venv .venv
           source .venv/bin/activate
           python -m pip install --upgrade pip
+          
+          # 1. 기본 요구사항 설치
           pip install --no-cache-dir -r requirements.txt
+          
+          # 2. 경로를 꼬이게 만드는 구글 코어 패키지들 강제 삭제
+          pip uninstall -y google google-api-core googleapis-common-protos google-auth
+          
+          # 3. 최신 표준 방식으로 전부 다시 묶어서 재설치
+          pip install --no-cache-dir --upgrade google-api-core googleapis-common-protos google-auth google-genai
 
       - name: 미국장 업데이트 및 AI 분석 (us 모드)
         env:
