@@ -1,5 +1,14 @@
-# google cloud credentials
+# Environments
+.env
+__pycache__/
+*.pyc
+
+# Google Sheets Auth
 credentials.json
+
+# IDE / OS
+.vscode/
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
