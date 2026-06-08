@@ -16,7 +16,7 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ⚠️ [필수 수정] 본인의 Streamlit 대시보드 주소를 여기에 넣으세요! (반드시 https:// 로 시작)
-DASHBOARD_URL = "https://본인의-스트림릿-주소.streamlit.app"
+DASHBOARD_URL = "https://finance-dashboard-mcgod.streamlit.app/"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
