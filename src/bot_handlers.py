@@ -1,6 +1,8 @@
 import asyncio
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+# --- 텔레그램 내장 웹뷰를 위한 라이브러리 추가 ---
+from telegram import WebAppInfo 
 import os
 import json
 import datetime
@@ -14,15 +16,30 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# 본인의 Streamlit 대시보드 주소를 여기에 넣으세요! (반드시 https:// 로 시작해야 합니다)
+DASHBOARD_URL = "https://본인의-스트림릿-주소.streamlit.app"
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
         "안녕하세요! AI 투자 어시스턴트입니다.\n\n"
-        "👇 아래 명령어와 자연어를 사용해 보세요.\n"
+        "👇 아래 버튼을 눌러 대시보드를 확인하거나 명령어를 입력해 보세요.\n"
         "- /ai : 오늘의 4인방 AI 심층 분석 리포트 확인\n"
-        "- 자산 조회: '지금 내 자산현황 알려줘', '포트폴리오 보여줘'\n"
+        "- 자산 조회: '지금 내 자산현황 알려줘'\n"
         "- 매매 기록: '오늘 테슬라 10주 170불에 매수했어'"
     )
-    await update.message.reply_text(welcome_msg)
+    
+    # 텔레그램 메시지 아래에 예쁜 버튼(Inline Keyboard) 만들기
+    keyboard = [
+        # 방법 A: 텔레그램 앱 내부에서 팝업으로 열기 (가장 추천하는 깔끔한 방식)
+        [InlineKeyboardButton("📈 내 포트폴리오 대시보드 열기", web_app=WebAppInfo(url=DASHBOARD_URL))],
+        
+        # 방법 B: 일반 인터넷 브라우저 앱(사파리/크롬)으로 열기 원할 경우 (참고용)
+        # [InlineKeyboardButton("🌐 외부 브라우저에서 대시보드 열기", url=DASHBOARD_URL)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # 메시지와 함께 버튼을 전송
+    await update.message.reply_text(welcome_msg, reply_markup=reply_markup)
 
 async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("데이터를 불러오는 중입니다... 🔄")
