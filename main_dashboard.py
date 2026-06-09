@@ -4,11 +4,13 @@ import os
 import json
 import requests
 from datetime import datetime
+from dotenv import load_dotenv # 💡 누락되었던 라이브러리 임포트를 완벽히 추가했습니다.
 from src.sheets_client import get_sheet_client
 
-# --- 페이지 기본 설정 ---
+# --- 페이지 기본 설정 (와이드 모드로 프로페셔널함 극대화) ---
 st.set_page_config(page_title="Hedge Fund Style Cockpit", page_icon="🏦", layout="wide")
 
+# --- 클라우드 배포용 환경변수 및 인증서 세팅 ---
 if "google_credentials" in st.secrets:
     try:
         creds_dict = dict(st.secrets["google_credentials"])
@@ -20,6 +22,7 @@ if "google_credentials" in st.secrets:
 load_dotenv()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or st.secrets.get("SPREADSHEET_ID")
 
+# --- 환율 가져오기 함수 ---
 def get_usd_krw_rate():
     try:
         res = requests.get("https://open.er-api.com/v6/latest/USD", timeout=3)
@@ -45,7 +48,7 @@ def load_all_dashboard_data():
         history_records = doc.worksheet("History").get_all_records()
         df_history = pd.DataFrame(history_records)
     except Exception:
-        pass # 아직 정산 로그가 쌓이기 전 상태
+        pass
         
     ai_records = doc.worksheet("AI_Reports").get_all_records()
     df_ai = pd.DataFrame(ai_records)
@@ -65,23 +68,18 @@ try:
         df_portfolio, df_history, latest_ai_report = load_all_dashboard_data()
 
     # ==========================================
-    # 📈 PART 1: 자산 성장 타임라인 트랙 (신설 영역)
+    # 📈 PART 1: 자산 성장 타임라인 트랙
     # ==========================================
     st.subheader("📈 자산 성장 타임라인 (Portfolio Wealth Timeline)")
     
     if not df_history.empty:
-        # 데이터 정제 및 날짜형 변환
         df_history['Total_Value_KRW'] = pd.to_numeric(df_history['Total_Value_KRW'], errors='coerce').fillna(0)
         
-        # 가독성을 위해 일자별/계좌별 피벗 가공
         df_timeline = df_history.groupby(['Date', 'Account'])['Total_Value_KRW'].sum().unstack(fill_value=0).reset_index()
         df_timeline['Date'] = pd.to_datetime(df_timeline['Date'])
         df_timeline = df_timeline.sort_values('Date').set_index('Date')
         
-        # 총자산 합산 컬럼 개설
         df_timeline['총 자산 총액'] = df_timeline.sum(axis=1)
-        
-        # 타임라인 멀티 선형 차트 렌더링
         st.line_chart(df_timeline[['총 자산 총액', '일반', '연금']], use_container_width=True)
     else:
         st.info("📅 아직 축적된 자산 시계열 히스토리 로그가 없습니다. 매일 밤 19시 정산 자동화 스크립트 실행 후 데이터 곡선이 형성됩니다.")
@@ -120,7 +118,6 @@ try:
         st.subheader("📊 자산 세부 보유 현황 (종목명 매핑 완료)")
         account_tab1, account_tab2, account_tab3 = st.tabs(["전체 보유 종목", "일반 계좌 포트", "연금 혜택 포트"])
         
-        # UI 가독성을 극대화하기 위해 Stock_Name을 앞으로 배치
         cols_order = ['Ticker', 'Stock_Name', 'Currency', 'Shares', 'Avg_Price', 'Current_Price', 'Total_Value_KRW', '1D_Return', 'Account']
         existing_cols = [c for c in cols_order if c in df_portfolio.columns]
         display_df = df_portfolio[existing_cols].copy()
@@ -138,7 +135,7 @@ try:
     st.markdown("---")
 
     # ==========================================
-    # 🤖 PART 3: AI 애널리스트 리포트 브리핑 룸
+    # 👑 PART 3: AI 애널리스트 리포트 브리핑 룸
     # ==========================================
     st.subheader("🤖 AI 리포트 브리핑 룸")
     if latest_ai_report is not None:
