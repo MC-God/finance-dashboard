@@ -5,18 +5,18 @@ from src.bot_handlers import start_command, ai_report_command, handle_message, h
 
 # 환경변수 로드 (.env 파일 읽기)
 load_dotenv()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 def main():
-    # 토큰 체크 안전장치
-    if not TELEGRAM_BOT_TOKEN:
-        print("❌ 시스템 에러: .env 파일에 TELEGRAM_BOT_TOKEN이 설정되지 않았습니다.")
+    # 토큰 체크 안전장치 (표준 규격: TELEGRAM_TOKEN)
+    if not TELEGRAM_TOKEN:
+        print("❌ 시스템 에러: .env 파일에 TELEGRAM_TOKEN이 설정되지 않았습니다.")
         return
 
-    print("📡 텔레그램 봇 인프라 구축을 시작합니다...")
+    print("📡 [표준 규격] 텔레그램 봇 인프라 구축을 시작합니다...")
     
     # python-telegram-bot 애플리케이션 빌드
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # 1. 기본 명령어(/start, /ai) 핸들러 등록
     application.add_handler(CommandHandler("start", start_command))

@@ -9,11 +9,13 @@ from google import genai
 from google.genai import types
 from src.sheets_client import get_sheet_client
 
+# 환경변수 로드
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ⚠️ 본인의 Streamlit 대시보드 주소를 여기에 정확히 기입하세요.
 DASHBOARD_URL = "https://본인의-스트림릿-주소.streamlit.app"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -23,11 +25,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /ai : 오늘의 4인방 AI 심층 분석 리포트 확인\n"
         "📸 보유 주식 현황 스크린샷을 보내주시면 자동으로 판독하여 시트에 입력해 드립니다!"
     )
+    # 구글 보안 정책 우회를 위해 외부 브라우저(사파리/크롬) 주소 호출 구조 고수
     keyboard = [[InlineKeyboardButton("📈 내 포트폴리오 대시보드 열기", url=DASHBOARD_URL)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(welcome_msg, reply_markup=reply_markup)
 
-# --- 📸 신규 기능: 이미지 캡처본 분석 핸들러 ---
+# --- 📸 이미지 캡처본 분석 핸들러 ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 이미지를 분석 중입니다... 잠시만 기다려주세요 (약 5~10초 소요)")
     
@@ -36,7 +39,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         
-        # 멀티모달 프롬프트 구성
         prompt = """
         첨부된 주식 보유 현황 스크린샷에서 종목 정보들을 정확하게 추출해줘.
         추출할 정보: 종목명 또는 티커(ticker), 보유 주식 수량(shares), 평균 매입 단가(price)
@@ -64,17 +66,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ 이미지에서 주식 보유 정보를 찾지 못했습니다. 화질을 확인하거나 직접 텍스트로 입력해 주세요.")
             return
             
-        # 임시 보관함에 파싱 데이터 저장 (사용자 컨텍스트 활용)
+        # 임시 보관함에 파싱 데이터 저장
         context.user_data['temp_ocr_data'] = parsed_stocks
         
-        # 사용자에게 파싱 결과 확인 메시지 유도
         confirm_msg = "🔍 **[이미지 분석 완료 결과]**\n\n"
         for idx, stock in enumerate(parsed_stocks, 1):
             confirm_msg += f"{idx}. **{stock['ticker']}** : {stock['shares']}주 (평단: {stock['price']:,}원)\n"
             
         confirm_msg += "\n위 데이터가 정확한가요? 저장할 계좌 종류를 선택하시면 구글 시트에 일괄 대량 입력됩니다."
         
-        # 인라인 버튼 제공 (일반/연금 선택)
         keyboard = [
             [
                 InlineKeyboardButton("📁 일반 계좌에 저장", callback_data="save_ocr_일반"),
@@ -116,8 +116,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         doc = sheet_client.open_by_key(SPREADSHEET_ID)
         tx_sheet = doc.worksheet("Transaction")
         
-        # 시트에 한 줄씩 대량 누적 입력
         for stock in stocks:
+            # 신규 기획에 맞추어 마지막 열에 'Account(일반/연금)' 데이터가 기록됩니다.
             new_row = [today_date, "매수", stock["ticker"], stock.get("shares", 0), stock.get("price", 0), action]
             tx_sheet.append_row(new_row)
             
@@ -127,7 +127,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         await query.edit_message_text(f"❌ 구글 시트 저장 중 예외 발생: {e}")
 
-# --- (기존의 명령어 핸들러 코드 유지) ---
 async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("데이터를 불러오는 중입니다... 🔄")
     try:
@@ -209,7 +208,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sheet_client = get_sheet_client()
             doc = sheet_client.open_by_key(SPREADSHEET_ID)
             tx_sheet = doc.worksheet("Transaction")
-            # 텍스트 입력 시에는 기본적으로 '일반' 계좌로 들어가도록 설정 (자연어 기입 가능 시 연동 확장 가능)
+            # 일반 텍스트 입력의 경우 기본값으로 '일반' 세팅
             new_row = [today_date, data["action"], data["ticker"], data.get("shares", 0), data.get("price", 0), "일반"]
             tx_sheet.append_row(new_row)
             await update.message.reply_text(f"✅ 구글 시트 기록 완료!\n[{data['action']}] {data['ticker']} {data.get('shares')}주 (단가: {data.get('price')})")
