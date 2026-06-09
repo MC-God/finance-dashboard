@@ -25,32 +25,39 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /ai : 오늘의 4인방 AI 심층 분석 리포트 확인\n"
         "📸 보유 주식 현황 스크린샷을 보내주시면 자동으로 판독하여 시트에 입력해 드립니다!"
     )
-    # 구글 보안 정책 우회를 위해 외부 브라우저(사파리/크롬) 주소 호출 구조 고수
     keyboard = [[InlineKeyboardButton("📈 내 포트폴리오 대시보드 열기", url=DASHBOARD_URL)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(welcome_msg, reply_markup=reply_markup)
 
 # --- 📸 이미지 캡처본 분석 핸들러 ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 이미지를 분석 중입니다... 잠시만 기다려주세요 (약 5~10초 소요)")
+    await update.message.reply_text("🤖 이미지를 분석하여 표준 코드로 변환 중입니다... (약 5~10초 소요)")
     
     try:
-        # 텔레그램 서버에서 이미지 파일 다운로드
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         
+        # 💡 한/미 주식 코드 표준화 및 통화 구분을 위한 고도화된 프롬프트
         prompt = """
         첨부된 주식 보유 현황 스크린샷에서 종목 정보들을 정확하게 추출해줘.
-        추출할 정보: 종목명 또는 티커(ticker), 보유 주식 수량(shares), 평균 매입 단가(price)
+        
+        ⚠️ [필수 변환 규칙]
+        1. ticker: FinanceDataReader가 인식할 수 있는 표준 코드로 변환해야 해.
+           - 한국 주식: 반드시 6자리 숫자 종목코드 (예: 삼성전자는 "005930", 현대차는 "005380")
+           - 미국 주식: 반드시 영문 대문자 티커 기호 (예: Apple은 "AAPL", Tesla는 "TSLA", NVDA 등)
+        2. currency: 해당 주식의 거래 통화를 판별해줘.
+           - 한국 주식 상장이면 "KRW"
+           - 미국 주식 상장이면 "USD"
+        3. shares: 보유 주식 수량 (숫자)
+        4. price: 평균 매입 단가 (숫자)
         
         출력은 반드시 다른 부가 설명 없이 오직 아래 스키마의 JSON 배열 형태로만 반환해줘.
         [
-            {"ticker": "AAPL", "shares": 10, "price": 175.5},
-            {"ticker": "005930", "shares": 50, "price": 72000}
+            {"ticker": "005930", "currency": "KRW", "shares": 50, "price": 72000},
+            {"ticker": "TSLA", "currency": "USD", "shares": 10, "price": 175.5}
         ]
         """
         
-        # Gemini Vision 분석 요청
         response = ai_client.models.generate_content(
             model='gemini-3.5-flash',
             contents=[
@@ -63,17 +70,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed_stocks = json.loads(response.text)
         
         if not parsed_stocks:
-            await update.message.reply_text("❌ 이미지에서 주식 보유 정보를 찾지 못했습니다. 화질을 확인하거나 직접 텍스트로 입력해 주세요.")
+            await update.message.reply_text("❌ 이미지에서 주식 보유 정보를 찾지 못했습니다.")
             return
             
-        # 임시 보관함에 파싱 데이터 저장
         context.user_data['temp_ocr_data'] = parsed_stocks
         
-        confirm_msg = "🔍 **[이미지 분석 완료 결과]**\n\n"
+        confirm_msg = "🔍 **[표준 코드 변환 판독 결과]**\n\n"
         for idx, stock in enumerate(parsed_stocks, 1):
-            confirm_msg += f"{idx}. **{stock['ticker']}** : {stock['shares']}주 (평단: {stock['price']:,}원)\n"
+            unit = "원" if stock['currency'] == "KRW" else "$"
+            confirm_msg += f"{idx}. **{stock['ticker']}** ({stock['currency']}) : {stock['shares']}주 (평단: {stock['price']:,}{unit})\n"
             
-        confirm_msg += "\n위 데이터가 정확한가요? 저장할 계좌 종류를 선택하시면 구글 시트에 일괄 대량 입력됩니다."
+        confirm_msg += "\n위 데이터가 정확한가요? 저장할 계좌 종류를 선택하시면 구글 시트에 일괄 입력됩니다."
         
         keyboard = [
             [
@@ -105,11 +112,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
     stocks = context.user_data.get('temp_ocr_data')
     if not stocks:
-        await query.edit_message_text("❌ 만료된 세션이거나 저장할 데이터가 존재하지 않습니다.")
+        await query.edit_message_text("❌ 저장할 데이터가 존재하지 않습니다.")
         return
         
     try:
-        await query.edit_message_text(f"📥 구글 시트({action} 계좌)에 일괄 기록 중...")
+        await query.edit_message_text(f"📥 구글 시트({action} 계좌)에 표준 데이터 기록 중...")
         
         today_date = datetime.datetime.now().strftime("%Y-%m-%d")
         sheet_client = get_sheet_client()
@@ -117,15 +124,84 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         tx_sheet = doc.worksheet("Transaction")
         
         for stock in stocks:
-            # 신규 기획에 맞추어 마지막 열에 'Account(일반/연금)' 데이터가 기록됩니다.
-            new_row = [today_date, "매수", stock["ticker"], stock.get("shares", 0), stock.get("price", 0), action]
+            # 헤더 규격 대응: Date, Action, Ticker, Shares, Price, Currency, Account 순서로 기록
+            new_row = [
+                today_date, 
+                "매수", 
+                stock["ticker"], 
+                stock.get("shares", 0), 
+                stock.get("price", 0), 
+                stock.get("currency", "KRW"), 
+                action
+            ]
             tx_sheet.append_row(new_row)
             
         context.user_data.pop('temp_ocr_data', None)
-        await query.edit_message_text(f"✅ 성공적으로 총 {len(stocks)}개의 종목 데이터가 **[{action} 계좌]** 트랜잭션 시트에 반영되었습니다!")
+        await query.edit_message_text(f"✅ 성공적으로 총 {len(stocks)}개의 종목이 표준 코드 및 통화 정보와 함께 **[{action} 계좌]**에 반영되었습니다!")
         
     except Exception as e:
         await query.edit_message_text(f"❌ 구글 시트 저장 중 예외 발생: {e}")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    await update.message.reply_text("🤖 입력하신 자연어를 표준 규격으로 해석 중입니다...")
+    
+    # 💡 텍스트 입력 프롬프트도 통화 및 표준 티커를 추출하도록 동시 고도화
+    prompt = f"""
+    사용자의 입력을 분석하여 의도(intent)를 파악하고, 결과를 오직 JSON 형식으로만 반환해.
+    
+    ⚠️ [필수 변환 규칙]
+    1. ticker: 한국 주식은 6자리 숫자 코드, 미국 주식은 영문 대문자 티커로 변환해.
+    2. currency: 한국 주식이면 "KRW", 미국 주식이면 "USD"로 판별해.
+    
+    입력: "{user_text}"
+    
+    JSON 스키마:
+    {{
+        "intent": "view_portfolio" OR "record_transaction" OR "unknown",
+        "action": "매수" 또는 "매도",
+        "ticker": "표준 주식 티커/코드",
+        "currency": "KRW" OR "USD",
+        "shares": 수량 (숫자),
+        "price": 단가 (숫자)
+    }}
+    """
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        data = json.loads(response.text)
+        intent = data.get("intent", "unknown")
+        
+        if intent == "view_portfolio":
+            await send_portfolio_status(update)
+        elif intent == "record_transaction":
+            if not data.get("ticker") or not data.get("action"):
+                 await update.message.reply_text("매매 기록으로 인식되었으나 핵심 정보가 누락되었습니다.")
+                 return
+            today_date = datetime.datetime.now().strftime("%Y-%m-%d")
+            sheet_client = get_sheet_client()
+            doc = sheet_client.open_by_key(SPREADSHEET_ID)
+            tx_sheet = doc.worksheet("Transaction")
+            
+            new_row = [
+                today_date, 
+                data["action"], 
+                data["ticker"], 
+                data.get("shares", 0), 
+                data.get("price", 0), 
+                data.get("currency", "KRW"), 
+                "일반"
+            ]
+            tx_sheet.append_row(new_row)
+            unit = "원" if data.get("currency") == "KRW" else "$"
+            await update.message.reply_text(f"✅ 구글 시트 기록 완료!\n[{data['action']}] {data['ticker']} ({data.get('currency')}) {data.get('shares')}주 (단가: {data.get('price'):,}{unit})")
+        else:
+            await update.message.reply_text("무슨 말씀인지 잘 모르겠어요. 다시 말씀해주세요!")
+    except Exception as e:
+        await update.message.reply_text(f"처리 중 오류가 발생했습니다: {e}")
 
 async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("데이터를 불러오는 중입니다... 🔄")
@@ -162,57 +238,14 @@ async def send_portfolio_status(update: Update):
                 c_price = row.get("Current_Price", 0)
                 d_return = row.get("1D_Return", 0)
                 account_type = row.get("Account", "일반")
+                currency = row.get("Currency", "USD" if str(ticker).isalpha() else "KRW")
+                unit = "원" if currency == "KRW" else "$"
                 try:
                     val = float(str(d_return).replace("%", "").strip())
                     icon = "🔴" if val > 0 else "🔵" if val < 0 else "⚪"
                 except ValueError:
                     icon = "⚪"
-                msg += f"▪️ **{ticker}** ({account_type}) : {shares}주\n   (현재가: {c_price} / 1D: {icon} {d_return}%)\n\n"
+                msg += f"▪️ **{ticker}** ({account_type} / {currency}) : {shares}주\n   (현재가: {c_price:,}{unit} / 1D: {icon} {d_return}%)\n\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"포트폴리오 조회 중 오류가 발생했습니다: {e}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    await update.message.reply_text("🤖 입력하신 내용을 분석 중입니다...")
-    
-    prompt = f"""
-    사용자의 입력을 분석하여 의도(intent)를 파악하고, 결과를 오직 JSON 형식으로만 반환해.
-    입력: "{user_text}"
-    
-    JSON 스키마:
-    {{
-        "intent": "view_portfolio" OR "record_transaction" OR "unknown",
-        "action": "매수" 또는 "매도",
-        "ticker": "주식 티커 (예: AAPL, NVDA, 005930)",
-        "shares": 수량 (숫자),
-        "price": 단가 (숫자)
-    }}
-    """
-    try:
-        response = ai_client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        data = json.loads(response.text)
-        intent = data.get("intent", "unknown")
-        
-        if intent == "view_portfolio":
-            await send_portfolio_status(update)
-        elif intent == "record_transaction":
-            if not data.get("ticker") or not data.get("action"):
-                 await update.message.reply_text("매매 기록으로 인식되었으나 종목명이나 액션이 누락되었습니다. 다시 말씀해주세요!")
-                 return
-            today_date = datetime.datetime.now().strftime("%Y-%m-%d")
-            sheet_client = get_sheet_client()
-            doc = sheet_client.open_by_key(SPREADSHEET_ID)
-            tx_sheet = doc.worksheet("Transaction")
-            # 일반 텍스트 입력의 경우 기본값으로 '일반' 세팅
-            new_row = [today_date, data["action"], data["ticker"], data.get("shares", 0), data.get("price", 0), "일반"]
-            tx_sheet.append_row(new_row)
-            await update.message.reply_text(f"✅ 구글 시트 기록 완료!\n[{data['action']}] {data['ticker']} {data.get('shares')}주 (단가: {data.get('price')})")
-        else:
-            await update.message.reply_text("무슨 말씀인지 잘 모르겠어요. 다시 말씀해주세요!")
-    except Exception as e:
-        await update.message.reply_text(f"처리 중 오류가 발생했습니다: {e}")
