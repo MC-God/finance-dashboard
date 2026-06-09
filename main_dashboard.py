@@ -4,7 +4,7 @@ import os
 import json
 import requests
 from datetime import datetime
-from dotenv import load_dotenv # 💡 누락되었던 라이브러리 임포트를 완벽히 추가했습니다.
+from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
 
 # --- 페이지 기본 설정 (와이드 모드로 프로페셔널함 극대화) ---
@@ -33,7 +33,7 @@ def get_usd_krw_rate():
     return 1350.0
 
 # --- 데이터 통합 로드 함수 ---
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=60)
 def load_all_dashboard_data():
     client = get_sheet_client()
     doc = client.open_by_key(SPREADSHEET_ID)
@@ -56,6 +56,14 @@ def load_all_dashboard_data():
     
     return df_portfolio, df_history, latest_ai_report
 
+# 💡 대소문자 및 공백 오차로 인한 KeyError를 원천 차단하는 정밀 컬럼 검색 추적기
+def find_column(df, possible_names):
+    for name in possible_names:
+        for col in df.columns:
+            if str(col).strip().lower() == name.lower():
+                return col
+    return None
+
 # --- 대시보드 메인 콕핏 렌더링 ---
 st.title("🏦 포트폴리오 자산 운용 콕핏 (Cockpit)")
 st.markdown("---")
@@ -68,42 +76,66 @@ try:
         df_portfolio, df_history, latest_ai_report = load_all_dashboard_data()
 
     # ==========================================
-    # 📈 PART 1: 자산 성장 타임라인 트랙
+    # 📈 PART 1: 자산 성장 타임라인 트랙 (안전 필터 강화)
     # ==========================================
     st.subheader("📈 자산 성장 타임라인 (Portfolio Wealth Timeline)")
     
-    if not df_history.empty:
-        df_history['Total_Value_KRW'] = pd.to_numeric(df_history['Total_Value_KRW'], errors='coerce').fillna(0)
-        
-        df_timeline = df_history.groupby(['Date', 'Account'])['Total_Value_KRW'].sum().unstack(fill_value=0).reset_index()
-        df_timeline['Date'] = pd.to_datetime(df_timeline['Date'])
-        df_timeline = df_timeline.sort_values('Date').set_index('Date')
-        
-        df_timeline['총 자산 총액'] = df_timeline.sum(axis=1)
-        st.line_chart(df_timeline[['총 자산 총액', '일반', '연금']], use_container_width=True)
+    val_col_hist = find_column(df_history, ['total_value_krw', 'value', '평가가치'])
+    date_col_hist = find_column(df_history, ['date', '날짜', '일자'])
+    acc_col_hist = find_column(df_history, ['account', '계좌', '계좌구분'])
+
+    if not df_history.empty and val_col_hist and date_col_hist and acc_col_hist:
+        try:
+            df_history[val_col_hist] = pd.to_numeric(df_history[val_col_hist], errors='coerce').fillna(0)
+            
+            df_timeline = df_history.groupby([date_col_hist, acc_col_hist])[val_col_hist].sum().unstack(fill_value=0).reset_index()
+            df_timeline[date_col_hist] = pd.to_datetime(df_timeline[date_col_hist])
+            df_timeline = df_timeline.sort_values(date_col_hist).set_index(date_col_hist)
+            
+            df_timeline = df_timeline.rename(columns={c: str(c) for c in df_timeline.columns})
+            df_timeline['총 자산 총액'] = df_timeline.sum(axis=1)
+            
+            chart_cols = ['총 자산 총액'] + [c for c in ['일반', '연금'] if c in df_timeline.columns]
+            st.line_chart(df_timeline[chart_cols], use_container_width=True)
+        except Exception as timeline_err:
+            st.warning(f"📊 시계열 데이터를 변환하는 중입니다. 잠시만 기다려주세요... (상세: {timeline_err})")
     else:
-        st.info("📅 아직 축적된 자산 시계열 히스토리 로그가 없습니다. 매일 밤 19시 정산 자동화 스크립트 실행 후 데이터 곡선이 형성됩니다.")
+        st.info("📅 아직 축적된 자산 시계열 히스토리 데이터가 충분하지 않습니다. 매일 밤 19시 정산 자동화 스크립트가 실행되면서 타임라인 곡선이 형성됩니다.")
         
     st.markdown("---")
 
     # ==========================================
     # 📊 PART 2: 실시간 KPI 전광판 및 테이블 자산 영역
     # ==========================================
-    if not df_portfolio.empty:
-        df_portfolio['Shares'] = pd.to_numeric(df_portfolio['Shares'], errors='coerce').fillna(0)
-        df_portfolio['Current_Price'] = pd.to_numeric(df_portfolio['Current_Price'], errors='coerce').fillna(0)
+    ticker_col = find_column(df_portfolio, ['ticker', '종목', '종목코드'])
+    shares_col = find_column(df_portfolio, ['shares', '수량', '보유수량'])
+    price_col = find_column(df_portfolio, ['current_price', '현재가', '가격'])
+    curr_col = find_column(df_portfolio, ['currency', '통화'])
+    acc_col = find_column(df_portfolio, ['account', '계좌'])
+    name_col = find_column(df_portfolio, ['stock_name', '종목명', '회사명'])
+    return_col = find_column(df_portfolio, ['1d_return', '등락률', '변동률'])
+    avg_col = find_column(df_portfolio, ['avg_price', '평단가', '매입단가'])
+
+    if not df_portfolio.empty and ticker_col and shares_col and price_col:
+        df_portfolio[shares_col] = pd.to_numeric(df_portfolio[shares_col], errors='coerce').fillna(0)
+        df_portfolio[price_col] = pd.to_numeric(df_portfolio[price_col], errors='coerce').fillna(0)
         
-        if 'Currency' not in df_portfolio.columns:
-            df_portfolio['Currency'] = df_portfolio['Ticker'].apply(lambda x: 'USD' if str(x).isalpha() else 'KRW')
+        if not curr_col:
+            df_portfolio['Currency'] = df_portfolio[ticker_col].apply(lambda x: 'USD' if str(x).isalpha() else 'KRW')
+            curr_col = 'Currency'
             
+        if not acc_col:
+            df_portfolio['Account'] = '일반'
+            acc_col = 'Account'
+
         df_portfolio['Total_Value_KRW'] = df_portfolio.apply(
-            lambda r: r['Shares'] * r['Current_Price'] * usd_krw if r['Currency'] == 'USD' else r['Shares'] * r['Current_Price'],
+            lambda r: r[shares_col] * r[price_col] * usd_krw if str(r[curr_col]).upper() == 'USD' else r[shares_col] * r[price_col],
             axis=1
         )
         
         total_asset = df_portfolio['Total_Value_KRW'].sum()
-        normal_asset = df_portfolio[df_portfolio['Account'] == '일반']['Total_Value_KRW'].sum()
-        pension_asset = df_portfolio[df_portfolio['Account'] == '연금']['Total_Value_KRW'].sum()
+        normal_asset = df_portfolio[df_portfolio[acc_col] == '일반']['Total_Value_KRW'].sum()
+        pension_asset = df_portfolio[df_portfolio[acc_col] == '연금']['Total_Value_KRW'].sum()
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -115,22 +147,21 @@ try:
             
         st.markdown("---")
 
-        st.subheader("📊 자산 세부 보유 현황 (종목명 매핑 완료)")
+        st.subheader("📊 자산 세부 보유 현황")
         account_tab1, account_tab2, account_tab3 = st.tabs(["전체 보유 종목", "일반 계좌 포트", "연금 혜택 포트"])
         
-        cols_order = ['Ticker', 'Stock_Name', 'Currency', 'Shares', 'Avg_Price', 'Current_Price', 'Total_Value_KRW', '1D_Return', 'Account']
-        existing_cols = [c for c in cols_order if c in df_portfolio.columns]
-        display_df = df_portfolio[existing_cols].copy()
+        display_cols = [c for c in [ticker_col, name_col, curr_col, shares_col, avg_col, price_col, 'Total_Value_KRW', return_col, acc_col] if c]
+        display_df = df_portfolio[display_cols].copy()
         
         with account_tab1:
             st.dataframe(display_df, use_container_width=True, hide_index=True)
         with account_tab2:
-            st.dataframe(display_df[display_df['Account'] == '일반'], use_container_width=True, hide_index=True)
+            st.dataframe(display_df[display_df[acc_col] == '일반'], use_container_width=True, hide_index=True)
         with account_tab3:
-            st.dataframe(display_df[display_df['Account'] == '연금'], use_container_width=True, hide_index=True)
+            st.dataframe(display_df[display_df[acc_col] == '연금'], use_container_width=True, hide_index=True)
             
     else:
-        st.info("현재 포트폴리오에 등록된 종목이 없습니다. 텔레그램을 통해 등록해 주세요.")
+        st.info("현재 포트폴리오에 등록된 종목이 없거나 동기화 중입니다. 텔레그램을 통해 등록해 주세요.")
 
     st.markdown("---")
 
