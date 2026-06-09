@@ -37,7 +37,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         
-        # 💡 한/미 주식 코드 표준화 및 통화 구분을 위한 고도화된 프롬프트
         prompt = """
         첨부된 주식 보유 현황 스크린샷에서 종목 정보들을 정확하게 추출해줘.
         
@@ -124,20 +123,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         tx_sheet = doc.worksheet("Transaction")
         
         for stock in stocks:
-            # 헤더 규격 대응: Date, Action, Ticker, Shares, Price, Currency, Account 순서로 기록
+            # 💡 [정방향 수정] 구글 시트 실제 컬럼 헤더 순서 반영: Account가 6번째, Currency가 7번째
             new_row = [
                 today_date, 
                 "매수", 
                 stock["ticker"], 
                 stock.get("shares", 0), 
                 stock.get("price", 0), 
-                stock.get("currency", "KRW"), 
-                action
+                action,                        # 6번째: Account (일반/연금)
+                stock.get("currency", "KRW")   # 7번째: Currency (KRW/USD)
             ]
             tx_sheet.append_row(new_row)
             
         context.user_data.pop('temp_ocr_data', None)
-        await query.edit_message_text(f"✅ 성공적으로 총 {len(stocks)}개의 종목이 표준 코드 및 통화 정보와 함께 **[{action} 계좌]**에 반영되었습니다!")
+        await query.edit_message_text(f"✅ 성공적으로 총 {len(stocks)}개의 종목이 정상 규격으로 **[{action} 계좌]**에 반영되었습니다!")
         
     except Exception as e:
         await query.edit_message_text(f"❌ 구글 시트 저장 중 예외 발생: {e}")
@@ -146,7 +145,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await update.message.reply_text("🤖 입력하신 자연어를 표준 규격으로 해석 중입니다...")
     
-    # 💡 텍스트 입력 프롬프트도 통화 및 표준 티커를 추출하도록 동시 고도화
     prompt = f"""
     사용자의 입력을 분석하여 의도(intent)를 파악하고, 결과를 오직 JSON 형식으로만 반환해.
     
@@ -186,18 +184,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc = sheet_client.open_by_key(SPREADSHEET_ID)
             tx_sheet = doc.worksheet("Transaction")
             
+            # 💡 [정방향 수정] 일반 자연어 입력 시에도 6번째 Account, 7번째 Currency 순서 일치
             new_row = [
                 today_date, 
                 data["action"], 
                 data["ticker"], 
                 data.get("shares", 0), 
                 data.get("price", 0), 
-                data.get("currency", "KRW"), 
-                "일반"
+                "일반",                         # 6번째: Account
+                data.get("currency", "KRW")   # 7번째: Currency
             ]
             tx_sheet.append_row(new_row)
             unit = "원" if data.get("currency") == "KRW" else "$"
-            await update.message.reply_text(f"✅ 구글 시트 기록 완료!\n[{data['action']}] {data['ticker']} ({data.get('currency')}) {data.get('shares')}주 (단가: {data.get('price'):,}{unit})")
+            await update.message.reply_text(f"✅ 구글 시트 기록 완료!\n[{data['action']}] {data['ticker']} {data.get('shares')}주 (단가: {data.get('price'):,}{unit})")
         else:
             await update.message.reply_text("무슨 말씀인지 잘 모르겠어요. 다시 말씀해주세요!")
     except Exception as e:
