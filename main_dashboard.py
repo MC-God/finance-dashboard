@@ -11,7 +11,7 @@ from src.sheets_client import get_sheet_client
 # --- 페이지 기본 설정 (와이드 레이아웃) ---
 st.set_page_config(page_title="Hedge Fund Style Cockpit", page_icon="🏦", layout="wide")
 
-# 가시성 극대화를 위한 전용 컴팩트 스타일 주입
+# 가시성 극대화를 위한 컴팩트 스타일 주입
 st.markdown("""
     <style>
     .report-box { background-color: #1a1c23; padding: 20px; border-radius: 8px; border-left: 5px solid #FF4B4B; margin-bottom: 15px; }
@@ -39,29 +39,43 @@ def get_usd_krw_rate():
         pass
     return 1350.0
 
-# 💡 [핵심 교정] get_all_records 대신 get_all_values를 사용하여 에러 원천 차단
+# 💡 [핵심 교정] 절대 죽지 않는 무적의 구글 시트 파싱 엔진 탑재
 @st.cache_data(ttl=30)
 def load_all_dashboard_data():
     client = get_sheet_client()
     doc = client.open_by_key(SPREADSHEET_ID)
     
-    # Portfolio 로드
-    portfolio_vals = doc.worksheet("Portfolio").get_all_values()
-    df_portfolio = pd.DataFrame(portfolio_vals[1:], columns=portfolio_vals[0]) if len(portfolio_vals) > 1 else pd.DataFrame()
+    def safe_get_df(sheet_name):
+        try:
+            sheet = doc.worksheet(sheet_name)
+            # 1단계: 가장 안정적인 records 파싱 시도
+            try:
+                records = sheet.get_all_records()
+                if records: return pd.DataFrame(records)
+            except Exception:
+                pass
+            
+            # 2단계: 에러 발생 시, values로 가져와 빈칸을 강제 채워(Padding) 직사각형 배열 조립
+            vals = sheet.get_all_values()
+            if len(vals) > 1:
+                headers = vals[0]
+                data = [row + [''] * (len(headers) - len(row)) for row in vals[1:]]
+                return pd.DataFrame(data, columns=headers)
+            return pd.DataFrame()
+        except Exception as e:
+            st.error(f"[{sheet_name}] 시트 로딩 중 시스템 예외 발생: {e}")
+            return pd.DataFrame()
+
+    df_portfolio = safe_get_df("Portfolio")
+    df_history = safe_get_df("History")
     
-    # History 로드 (절대 실패하지 않는 파싱 방식)
-    df_history = pd.DataFrame()
     try:
-        history_vals = doc.worksheet("History").get_all_values()
-        if len(history_vals) > 1:
-            df_history = pd.DataFrame(history_vals[1:], columns=history_vals[0])
+        ai_records = doc.worksheet("AI_Reports").get_all_records()
+        df_ai = pd.DataFrame(ai_records)
+        latest_ai_report = df_ai.iloc[-1] if not df_ai.empty else None
     except Exception:
-        pass
+        latest_ai_report = None
         
-    ai_records = doc.worksheet("AI_Reports").get_all_records()
-    df_ai = pd.DataFrame(ai_records)
-    latest_ai_report = df_ai.iloc[-1] if not df_ai.empty else None
-    
     return df_portfolio, df_history, latest_ai_report
 
 def find_column(df, possible_names):
@@ -107,7 +121,6 @@ try:
             latest_date = unique_dates[-1]
             prev_date = unique_dates[-2]
             
-            # 구글 시트 특유의 콤마(,) 텍스트 무력화
             df_h_clean[val_col] = pd.to_numeric(df_h_clean[val_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
             
             def sum_val_for_date(target_date):
@@ -213,7 +226,7 @@ try:
                 df_timeline['총자산'] = df_timeline.sum(axis=1)
                 st.line_chart(df_timeline)
             except Exception as e:
-                st.error(f"차트 렌더링 중 오류: {e}")
+                st.error(f"차트 렌더링 중 오류 발생: {e}")
         else:
             st.info("📅 아직 데이터 축적량이 부족합니다. 역사 데이터 곡선이 곧 형성됩니다.")
 
