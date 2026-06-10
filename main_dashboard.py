@@ -8,17 +8,15 @@ from datetime import datetime
 from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
 
-# --- 페이지 기본 설정 (와이드 레이아웃) ---
+# --- 페이지 기본 설정 ---
 st.set_page_config(page_title="Hedge Fund Style Cockpit", page_icon="🏦", layout="wide")
 
-# 가시성 극대화를 위한 컴팩트 스타일 주입
 st.markdown("""
     <style>
     .report-box { background-color: #1a1c23; padding: 20px; border-radius: 8px; border-left: 5px solid #FF4B4B; margin-bottom: 15px; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 클라우드 배포용 환경변수 및 인증서 세팅 ---
 if "google_credentials" in st.secrets:
     try:
         creds_dict = dict(st.secrets["google_credentials"])
@@ -39,7 +37,7 @@ def get_usd_krw_rate():
         pass
     return 1350.0
 
-# 💡 [핵심 교정] 절대 죽지 않는 무적의 구글 시트 파싱 엔진 탑재
+# 💡 [핵심 교정] 어떤 구글 시트 오류에도 무너지지 않는 무적 파싱 엔진
 @st.cache_data(ttl=30)
 def load_all_dashboard_data():
     client = get_sheet_client()
@@ -48,22 +46,34 @@ def load_all_dashboard_data():
     def safe_get_df(sheet_name):
         try:
             sheet = doc.worksheet(sheet_name)
-            # 1단계: 가장 안정적인 records 파싱 시도
-            try:
-                records = sheet.get_all_records()
-                if records: return pd.DataFrame(records)
-            except Exception:
-                pass
-            
-            # 2단계: 에러 발생 시, values로 가져와 빈칸을 강제 채워(Padding) 직사각형 배열 조립
             vals = sheet.get_all_values()
-            if len(vals) > 1:
-                headers = vals[0]
-                data = [row + [''] * (len(headers) - len(row)) for row in vals[1:]]
-                return pd.DataFrame(data, columns=headers)
-            return pd.DataFrame()
+            if not vals:
+                return pd.DataFrame()
+                
+            # 1단계: 시트를 뒤져서 'Date', 'Ticker', '종목' 등의 키워드가 있는 진짜 머리글 위치를 찾음
+            header_idx = 0
+            for i, row in enumerate(vals):
+                row_str = "".join([str(x).lower() for x in row])
+                if 'ticker' in row_str or '종목' in row_str or 'date' in row_str or '날짜' in row_str:
+                    header_idx = i
+                    break
+                    
+            headers = vals[header_idx]
+            clean_headers = [str(h).strip() if str(h).strip() else f"Unnamed_{j}" for j, h in enumerate(headers)]
+            
+            # 2단계: 머리글 밑의 데이터를 추출하고, 빈칸을 패딩하여 완벽한 표(DataFrame)로 강제 조립
+            if len(vals) > header_idx + 1:
+                data = vals[header_idx+1:]
+                data = [row + [''] * (len(clean_headers) - len(row)) for row in data]
+                data = [row[:len(clean_headers)] for row in data]
+                df = pd.DataFrame(data, columns=clean_headers)
+                
+                # 완전히 텅 빈 깡통 행(찌꺼기) 제거
+                df = df[df.apply(lambda r: "".join(r.astype(str)).strip() != "", axis=1)]
+                return df
+            return pd.DataFrame(columns=clean_headers)
         except Exception as e:
-            st.error(f"[{sheet_name}] 시트 로딩 중 시스템 예외 발생: {e}")
+            st.error(f"[{sheet_name}] 데이터 로딩 중 예외 발생: {e}")
             return pd.DataFrame()
 
     df_portfolio = safe_get_df("Portfolio")
@@ -178,7 +188,7 @@ try:
         pension_asset = df_portfolio[df_portfolio[find_column(df_portfolio, ['account', 'Account'])] == '연금']['Total_Value_KRW'].sum()
 
     # ==========================================
-    # 💰 PART 1: 💡 커스텀 HTML KPI 전광판 (절대 짤리지 않는 완벽한 폼)
+    # 💰 PART 1: 커스텀 HTML KPI 전광판
     # ==========================================
     def render_metric_card(title, value, diff, pct):
         if diff > 0:
@@ -205,7 +215,7 @@ try:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ==========================================
-    # 📈 PART 2: 하이엔드 비중 및 시계열 차트
+    # 📈 PART 2: 자산 시계열 및 비중 차트
     # ==========================================
     g1, g2 = st.columns([6, 4])
     
@@ -226,7 +236,7 @@ try:
                 df_timeline['총자산'] = df_timeline.sum(axis=1)
                 st.line_chart(df_timeline)
             except Exception as e:
-                st.error(f"차트 렌더링 중 오류 발생: {e}")
+                st.error(f"차트 렌더링 중 오류: {e}")
         else:
             st.info("📅 아직 데이터 축적량이 부족합니다. 역사 데이터 곡선이 곧 형성됩니다.")
 
@@ -256,7 +266,7 @@ try:
     st.markdown("---")
 
     # ==========================================
-    # 📊 PART 3: 자산 세부 보유 현황 테이블 고도화
+    # 📊 PART 3: 자산 세부 보유 현황
     # ==========================================
     st.subheader("📊 핵심 포트폴리오 스냅샷 (수익률 순 정렬)")
     if not df_portfolio.empty:
@@ -284,27 +294,30 @@ try:
     else:
         st.info("조회할 세부 장부가 비어 있습니다.")
 
-    # ==========================================
-    # 🤖 PART 4: AI 리포트 브리핑 룸
-    # ==========================================
     st.markdown("---")
-    st.subheader("🤖 AI 리포트 브리핑 룸 (Hedge Fund Consensus)")
+    st.subheader("🤖 AI 리포트 브리핑 룸")
     if latest_ai_report is not None:
         st.caption(f"📅 리포트 공시 시점: {latest_ai_report.get('Date', 'N/A')}")
-        
-        tab1, tab2, tab3, tab4 = st.tabs(["📉 퀀트 (Quant)", "🌍 매크로 (Macro)", "💎 가치투자 (Value)", "🚀 텐베거 (10-Bagger)"])
-        
+        tab1, tab2, tab3, tab4 = st.tabs(["📉 퀀트", "🌍 매크로", "💎 가치투자", "🚀 텐베거"])
         def render_structured_report(title, raw_content):
-            st.markdown(f"### 📋 {title} 부문 정밀 컨센서스")
-            st.markdown("<div class='report-box'>", unsafe_allow_html=True)
-            st.markdown(f"**📢 주요 권고사항 및 전략적 포지셔닝**\n\n{raw_content}")
-            st.markdown("</div>", unsafe_allow_html=True)
-            st.caption("ℹ️ 해당 리포트는 데이터 마스터 팩터 알고리즘에 의해 자동 생성된 보조 지표입니다.")
+            st.markdown(f"### 📋 {title}")
+            st.markdown(f"<div class='report-box'>{raw_content}</div>", unsafe_allow_html=True)
+        with tab1: render_structured_report("퀀트 포지셔닝", latest_ai_report.get('Quant_Opinion', '데이터 없음'))
+        with tab2: render_structured_report("매크로 포지셔닝", latest_ai_report.get('Macro_Opinion', '데이터 없음'))
+        with tab3: render_structured_report("밸류에이션 점검", latest_ai_report.get('Value_Opinion', '데이터 없음'))
+        with tab4: render_structured_report("텐베거 탐색", latest_ai_report.get('Ten_Bagger_Opinion', '데이터 없음'))
 
-        with tab1: render_structured_report("시스템 퀀트 분석", latest_ai_report.get('Quant_Opinion', '브리핑 데이터가 업데이트되지 않았습니다.'))
-        with tab2: render_structured_report("글로벌 매크로 환경 분석", latest_ai_report.get('Macro_Opinion', '브리핑 데이터가 업데이트되지 않았습니다.'))
-        with tab3: render_structured_report("기본적 가치 및 마진 분석", latest_ai_report.get('Value_Opinion', '브리핑 데이터가 업데이트되지 않았습니다.'))
-        with tab4: render_structured_report("혁신 도출 텐베거 분석", latest_ai_report.get('Ten_Bagger_Opinion', '브리핑 데이터가 업데이트되지 않았습니다.'))
+    # ==========================================
+    # 🛠️ 엔지니어 전용 시스템 디버거 (최하단 은닉)
+    # ==========================================
+    with st.expander("🛠️ 시스템 디버깅 콘솔 (데이터 스캐닝 결과 확인)"):
+        st.write("✅ **Portfolio 시트 인식 상태:**", f"{len(df_portfolio)}행 로드됨")
+        st.write("✅ **History 시트 인식 상태:**", f"{len(df_history)}행 로드됨")
+        if not df_history.empty:
+            st.write("➡️ **History 컬럼 구조:**", df_history.columns.tolist())
+            st.dataframe(df_history.tail(3))
+        else:
+            st.error("❌ History 데이터를 파이썬이 전혀 읽지 못하고 있습니다.")
 
 except Exception as e:
     st.error("대시보드 엔진 구동 중 예외가 발생했습니다.")
