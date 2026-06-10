@@ -3,8 +3,9 @@ import pandas as pd
 import os
 import json
 import requests
-import yfinance as yf
+import datetime
 import plotly.express as px
+import pandas_datareader.data as web
 from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
 
@@ -145,52 +146,63 @@ try:
         normal_asset = df_port[df_port['Account'] == '일반']['Total_Value_KRW'].sum()
         pension_asset = df_port[df_port['Account'] == '연금']['Total_Value_KRW'].sum()
 
-    # --- 매크로 지표 패널 ---
+    # --- 공통 렌더링 함수 (빨강=상승, 파랑=하락 통일) ---
+    def render_card(title, value, diff, pct=None, unit="원"):
+        if diff > 0:
+            color, arrow, sign = "#FF4B4B", "🔺", "+"
+        elif diff < 0:
+            color, arrow, sign = "#1C83E1", "🔻", ""
+        else:
+            color, arrow, sign = "#888888", "▫️", ""
+            
+        value_fmt = f"{value:,.0f}" if unit == "원" else f"{value:.2f}"
+        diff_fmt = f"{diff:,.0f} {unit}" if unit == "원" else f"{diff:.2f}%p"
+        pct_str = f" ({sign}{pct:.2f}%)" if pct is not None else ""
+        
+        return f"""
+        <div class="metric-card">
+            <p class="metric-title">{title}</p>
+            <h2 class="metric-value">{value_fmt} <span class="metric-unit">{unit}</span></h2>
+            <p style="color: {color}; margin-top: 8px; font-size: 15px; margin-bottom: 0; font-weight: 500;">{arrow} {sign}{diff_fmt}{pct_str}</p>
+        </div>
+        """
+
+    # --- 매크로 지표 패널 (미국채 2, 10, 30년물) ---
     st.markdown("### 🌍 글로벌 매크로 지표 (실시간)")
     macro_cols = st.columns(3)
     
     @st.cache_data(ttl=3600)
-    def fetch_macro_indicators():
+    def fetch_treasury_yields():
         try:
-            vix_data = yf.Ticker("^VIX").history(period="2d")
-            us10y_data = yf.Ticker("^TNX").history(period="2d")
+            end = datetime.datetime.now()
+            start = end - datetime.timedelta(days=10)
             
-            vix = vix_data['Close'].iloc[-1] if not vix_data.empty else 0
-            vix_diff = vix - vix_data['Close'].iloc[-2] if len(vix_data) > 1 else 0
+            df_2y = web.DataReader('DGS2', 'fred', start, end).dropna()
+            df_10y = web.DataReader('DGS10', 'fred', start, end).dropna()
+            df_30y = web.DataReader('DGS30', 'fred', start, end).dropna()
             
-            us10y = us10y_data['Close'].iloc[-1] if not us10y_data.empty else 0
-            us10y_diff = us10y - us10y_data['Close'].iloc[-2] if len(us10y_data) > 1 else 0
-            
-            return vix, vix_diff, us10y, us10y_diff
+            def get_vals(df):
+                if len(df) >= 2: return df.iloc[-1, 0], df.iloc[-1, 0] - df.iloc[-2, 0]
+                elif len(df) == 1: return df.iloc[-1, 0], 0
+                return 0, 0
+                
+            return *get_vals(df_2y), *get_vals(df_10y), *get_vals(df_30y)
         except:
-            return 0, 0, 0, 0
+            return 0,0, 0,0, 0,0
 
-    vix_val, vix_diff, us10y_val, us10y_diff = fetch_macro_indicators()
+    y2_val, y2_diff, y10_val, y10_diff, y30_val, y30_diff = fetch_treasury_yields()
 
-    with macro_cols[0]:
-        st.metric(label="🇺🇸 미 10년물 국채 금리", value=f"{us10y_val:.2f}%", delta=f"{us10y_diff:+.2f}%p", delta_color="inverse")
-    with macro_cols[1]:
-        st.metric(label="📉 VIX (변동성 지수)", value=f"{vix_val:.2f}", delta=f"{vix_diff:+.2f}", delta_color="inverse")
-    with macro_cols[2]:
-        st.metric(label="💵 원/달러 환율", value=f"{usd_krw:,.2f} 원", delta=None)
+    with macro_cols[0]: st.markdown(render_card("🇺🇸 미 2년물 국채 금리", y2_val, y2_diff, unit="%"), unsafe_allow_html=True)
+    with macro_cols[1]: st.markdown(render_card("🇺🇸 미 10년물 국채 금리", y10_val, y10_diff, unit="%"), unsafe_allow_html=True)
+    with macro_cols[2]: st.markdown(render_card("🇺🇸 미 30년물 국채 금리", y30_val, y30_diff, unit="%"), unsafe_allow_html=True)
         
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # --- PART 1: 커스텀 HTML 전광판 ---
-    def render_card(title, value, diff, pct):
-        color, arrow, sign = ("#FF4B4B", "🔺", "+") if diff > 0 else ("#1C83E1", "🔻", "") if diff < 0 else ("#888888", "▫️", "+")
-        return f"""
-        <div class="metric-card">
-            <p class="metric-title">{title}</p>
-            <h2 class="metric-value">{value:,.0f} <span class="metric-unit">원</span></h2>
-            <p style="color: {color}; margin-top: 8px; font-size: 15px; margin-bottom: 0; font-weight: 500;">{arrow} {sign}{diff:,.0f} 원 ({sign}{pct:.2f}%)</p>
-        </div>
-        """
-
+    # --- PART 1: 커스텀 HTML 전광판 (자산) ---
     col1, col2, col3 = st.columns(3)
-    with col1: st.markdown(render_card("💰 총 자산 합계", total_asset, total_diff, total_pct), unsafe_allow_html=True)
-    with col2: st.markdown(render_card("💵 일반 주식계좌 자산", normal_asset, normal_diff, normal_pct), unsafe_allow_html=True)
-    with col3: st.markdown(render_card("🛡️ 연금저축/IRP 자산", pension_asset, pension_diff, pension_pct), unsafe_allow_html=True)
+    with col1: st.markdown(render_card("💰 총 자산 합계", total_asset, total_diff, total_pct, "원"), unsafe_allow_html=True)
+    with col2: st.markdown(render_card("💵 일반 주식계좌 자산", normal_asset, normal_diff, normal_pct, "원"), unsafe_allow_html=True)
+    with col3: st.markdown(render_card("🛡️ 연금저축/IRP 자산", pension_asset, pension_diff, pension_pct, "원"), unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
     # --- PART 2: 시계열 및 비중 차트 ---
@@ -246,7 +258,8 @@ try:
         df_display['현재가'] = df_port.apply(lambda r: f"${r['Current_Price']:,.2f}" if r['Currency'] == 'USD' else f"{int(r['Current_Price']):,}원", axis=1)
         
         df_display['ROI_Val'] = df_port['ROI']
-        df_display['수익률'] = df_port['ROI'].apply(lambda x: f"🔺 {x:+.2f}%" if x > 0 else f"🔻 {x:+.2f}%" if x < 0 else f"▫️ {x:.2f}%")
+        # 빨간 위삼각형, 파랑 아래삼각형 전역 통일
+        df_display['수익률'] = df_port['ROI'].apply(lambda x: f"🔺 +{x:.2f}%" if x > 0 else f"🔻 {x:.2f}%" if x < 0 else f"▫️ {x:.2f}%")
         df_display['평가가치'] = df_port['Total_Value_KRW'].apply(lambda x: f"{int(x):,} 원")
         df_display['계좌'] = df_port['Account']
         
