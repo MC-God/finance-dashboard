@@ -15,8 +15,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ⚠️ 본인의 Streamlit 대시보드 주소를 여기에 정확히 기입하세요.
-DASHBOARD_URL = "https://본인의-스트림릿-주소.streamlit.app"
+# 💡 회원님의 공식 스트림릿 대시보드 주소로 완벽하게 수정 반영했습니다!
+DASHBOARD_URL = "https://finance-dashboard-mcgod.streamlit.app"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
@@ -25,6 +25,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /ai : 오늘의 4인방 AI 심층 분석 리포트 확인\n"
         "📸 보유 주식 현황 스크린샷을 보내주시면 자동으로 판독하여 시트에 입력해 드립니다!"
     )
+    # 구글 보안 정책 우회를 위해 외부 브라우저(사파리/크롬) 주소 호출 구조 고수
     keyboard = [[InlineKeyboardButton("📈 내 포트폴리오 대시보드 열기", url=DASHBOARD_URL)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(welcome_msg, reply_markup=reply_markup)
@@ -123,15 +124,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         tx_sheet = doc.worksheet("Transaction")
         
         for stock in stocks:
-            # 💡 [정방향 수정] 구글 시트 실제 컬럼 헤더 순서 반영: Account가 6번째, Currency가 7번째
+            # 구글 시트 실제 컬럼 헤더 순서 반영: Account가 6번째, Currency가 7번째
             new_row = [
                 today_date, 
                 "매수", 
                 stock["ticker"], 
                 stock.get("shares", 0), 
                 stock.get("price", 0), 
-                action,                        # 6번째: Account (일반/연금)
-                stock.get("currency", "KRW")   # 7번째: Currency (KRW/USD)
+                action,                        
+                stock.get("currency", "KRW")   
             ]
             tx_sheet.append_row(new_row)
             
@@ -143,7 +144,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    await update.message.reply_text("🤖 입력하신 자연어를 표준 규격으로 해석 중입니다...")
+    await update.message.reply_text("🤖 입력하신 내용을 분석 중입니다...")
     
     prompt = f"""
     사용자의 입력을 분석하여 의도(intent)를 파악하고, 결과를 오직 JSON 형식으로만 반환해.
@@ -184,15 +185,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc = sheet_client.open_by_key(SPREADSHEET_ID)
             tx_sheet = doc.worksheet("Transaction")
             
-            # 💡 [정방향 수정] 일반 자연어 입력 시에도 6번째 Account, 7번째 Currency 순서 일치
             new_row = [
                 today_date, 
                 data["action"], 
                 data["ticker"], 
                 data.get("shares", 0), 
                 data.get("price", 0), 
-                "일반",                         # 6번째: Account
-                data.get("currency", "KRW")   # 7번째: Currency
+                "일반",                         
+                data.get("currency", "KRW")   
             ]
             tx_sheet.append_row(new_row)
             unit = "원" if data.get("currency") == "KRW" else "$"
