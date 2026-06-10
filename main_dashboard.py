@@ -34,20 +34,26 @@ def get_usd_krw_rate():
     except Exception: pass
     return 1350.0
 
-# --- 2. 직관적이고 깔끔한 데이터 로드 ---
+# --- 2. 직관적이고 튼튼한 데이터 로드 (정공법) ---
 @st.cache_data(ttl=30)
 def load_data():
     client = get_sheet_client()
     doc = client.open_by_key(SPREADSHEET_ID)
     
-    # get_all_records()는 첫 행을 헤더로 삼아 깔끔한 딕셔너리 리스트를 반환합니다.
-    df_port = pd.DataFrame(doc.worksheet("Portfolio").get_all_records())
+    # 💡 에러의 주범인 get_all_records() 대신 무조건 데이터를 텍스트로 가져오는 get_all_values() 사용
+    def fetch_sheet(name):
+        try:
+            vals = doc.worksheet(name).get_all_values()
+            if len(vals) > 1:
+                return pd.DataFrame(vals[1:], columns=vals[0])
+            return pd.DataFrame()
+        except Exception as e:
+            st.error(f"[{name}] 시트 데이터 로드 중 오류 발생: {e}")
+            return pd.DataFrame()
+
+    df_port = fetch_sheet("Portfolio")
+    df_hist = fetch_sheet("History")
     
-    try:
-        df_hist = pd.DataFrame(doc.worksheet("History").get_all_records())
-    except Exception:
-        df_hist = pd.DataFrame()
-        
     try:
         ai_records = doc.worksheet("AI_Reports").get_all_records()
         latest_ai = ai_records[-1] if ai_records else None
@@ -58,7 +64,7 @@ def load_data():
 
 # --- 3. 데이터 전처리 및 핵심 연산 ---
 def process_history(df):
-    """History 데이터를 연산하기 좋은 순수 숫자/날짜 포맷으로 변환"""
+    """History 데이터를 연산하기 좋은 순수 숫자/날짜 포맷으로 강제 변환"""
     if df.empty or 'Date' not in df.columns or 'Total_Value_KRW' not in df.columns:
         return pd.DataFrame()
     
