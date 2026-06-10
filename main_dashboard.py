@@ -8,14 +8,15 @@ from datetime import datetime
 from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
 
-# --- 페이지 기본 설정 (와이드 모드 적용) ---
+# --- 페이지 기본 설정 (와이드 레이아웃) ---
 st.set_page_config(page_title="Hedge Fund Style Cockpit", page_icon="🏦", layout="wide")
 
-# Custom CSS를 주입하여 표와 UI의 폰트 및 프로페셔널한 금융 다크톤 레이아웃 보완
+# 가시성 극대화를 위한 전용 컴팩트 스타일 주입
 st.markdown("""
     <style>
-    .metric-label { font-size: 14px !important; color: #888888 !important; }
-    .stDataFrame div[data-testid="stTable"] { font-size: 13px !important; }
+    div[data-testid="stMetric"] { background-color: #1e222b; padding: 15px; border-radius: 8px; border: 1px solid #2e3440; }
+    div[data-testid="stMetricLabel"] { font-size: 14px !important; color: #b0b5c0 !important; }
+    .report-box { background-color: #1a1c23; padding: 20px; border-radius: 8px; border-left: 5px solid #FF4B4B; margin-bottom: 15px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -31,7 +32,6 @@ if "google_credentials" in st.secrets:
 load_dotenv()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or st.secrets.get("SPREADSHEET_ID")
 
-# --- 환율 가져오기 함수 ---
 def get_usd_krw_rate():
     try:
         res = requests.get("https://open.er-api.com/v6/latest/USD", timeout=3)
@@ -41,7 +41,6 @@ def get_usd_krw_rate():
         pass
     return 1350.0
 
-# --- 데이터 통합 로드 함수 ---
 @st.cache_data(ttl=30)
 def load_all_dashboard_data():
     client = get_sheet_client()
@@ -63,7 +62,6 @@ def load_all_dashboard_data():
     
     return df_portfolio, df_history, latest_ai_report
 
-# 유연한 컬럼 검색기
 def find_column(df, possible_names):
     if df is None or df.empty:
         return None
@@ -73,7 +71,6 @@ def find_column(df, possible_names):
                 return col
     return None
 
-# --- 대시보드 메인 콕핏 렌더링 ---
 st.title("🏦 포트폴리오 자산 운용 콕핏")
 
 try:
@@ -83,7 +80,7 @@ try:
     with st.spinner("인프라 데이터 동기화 중..."):
         df_portfolio, df_history, latest_ai_report = load_all_dashboard_data()
 
-    # --- 💡 1. 전일 대비 증감 연산 로직 전면 재개편 ---
+    # --- 💡 전일 대비 증감 연산 철통 방어 로직 ---
     def get_delta_fixed(df_h, account_filter=None):
         if df_h is None or df_h.empty: 
             return 0, 0
@@ -97,9 +94,10 @@ try:
             
         try:
             df_h_clean = df_h.copy()
-            # 날짜 포맷 표준화 문자열 변환 후 유일 날짜 소팅
-            df_h_clean[date_col] = df_h_clean[date_col].astype(str).str.strip()
-            unique_dates = sorted(df_h_clean[date_col].unique())
+            # 💡 구글 시트의 날짜 포맷이 어떤 형태든 완벽하게 파이썬 날짜(Date) 객체로 강제 정규화
+            df_h_clean['parsed_date'] = pd.to_datetime(df_h_clean[date_col], errors='coerce').dt.date
+            # 문자열 등 오류로 인한 NaT(결측치) 제거 후 오름차순 정렬
+            unique_dates = sorted(df_h_clean['parsed_date'].dropna().unique())
             
             if len(unique_dates) < 2: 
                 return 0, 0
@@ -107,11 +105,14 @@ try:
             latest_date = unique_dates[-1]
             prev_date = unique_dates[-2]
             
+            # 가치 산정 시 구글 시트 특유의 콤마(,) 텍스트 무력화
+            df_h_clean[val_col] = pd.to_numeric(df_h_clean[val_col].replace({',': ''}, regex=True), errors='coerce').fillna(0)
+            
             def sum_val_for_date(target_date):
-                target_df = df_h_clean[df_h_clean[date_col] == target_date]
+                target_df = df_h_clean[df_h_clean['parsed_date'] == target_date]
                 if account_filter:
                     target_df = target_df[target_df[acc_col_h].astype(str).str.strip() == account_filter]
-                return pd.to_numeric(target_df[val_col], errors='coerce').sum()
+                return target_df[val_col].sum()
                 
             curr_sum = sum_val_for_date(latest_date)
             prev_sum = sum_val_for_date(prev_date)
@@ -122,7 +123,6 @@ try:
         except Exception:
             return 0, 0
 
-    # 기본 컬럼 매핑 추적
     ticker_col = find_column(df_portfolio, ['ticker', '종목', '종목코드'])
     shares_col = find_column(df_portfolio, ['shares', '수량', '보유수량'])
     price_col = find_column(df_portfolio, ['current_price', '현재가', '가격'])
@@ -130,14 +130,13 @@ try:
     curr_col = find_column(df_portfolio, ['currency', '통화'])
     acc_col = find_column(df_portfolio, ['account', '계좌', '계좌구분'])
     name_col = find_column(df_portfolio, ['stock_name', '종목명', '회사명'])
-    return_col = find_column(df_portfolio, ['1d_return', '등락률', '변동률'])
 
     total_asset, normal_asset, pension_asset = 0, 0, 0
     total_diff, total_pct = get_delta_fixed(df_history)
     normal_diff, normal_pct = get_delta_fixed(df_history, "일반")
     pension_diff, pension_pct = get_delta_fixed(df_history, "연금")
 
-    if not df_portfolio.empty and ticker_col and shares_col and price_col:
+    if not df_portfolio.empty and ticker_col and shares_col and price_col and avg_col:
         df_portfolio[shares_col] = pd.to_numeric(df_portfolio[shares_col], errors='coerce').fillna(0)
         df_portfolio[price_col] = pd.to_numeric(df_portfolio[price_col], errors='coerce').fillna(0)
         df_portfolio[avg_col] = pd.to_numeric(df_portfolio[avg_col], errors='coerce').fillna(0)
@@ -150,12 +149,11 @@ try:
             axis=1
         )
         
-        # 💡 2. 자산 테이블 가시성을 극대화하기 위한 개별 수익률(ROI) 연산 추가
         df_portfolio['Total_Cost_KRW'] = df_portfolio.apply(
             lambda r: r[shares_col] * r[avg_col] * usd_krw if str(r[find_column(df_portfolio, ['currency', 'Currency'])]).upper() == 'USD' else r[shares_col] * r[avg_col],
             axis=1
         )
-        df_portfolio['수익률'] = df_portfolio.apply(
+        df_portfolio['수익률_수치'] = df_portfolio.apply(
             lambda r: ((r['Total_Value_KRW'] - r['Total_Cost_KRW']) / r['Total_Cost_KRW'] * 100) if r['Total_Cost_KRW'] != 0 else 0.0,
             axis=1
         )
@@ -165,7 +163,7 @@ try:
         pension_asset = df_portfolio[df_portfolio[find_column(df_portfolio, ['account', 'Account'])] == '연금']['Total_Value_KRW'].sum()
 
     # ==========================================
-    # 💰 PART 1: High-End KPI 전광판 메트릭 (교정 완료)
+    # 💰 PART 1: KPI 전광판 메트릭 (한국 주식 관습 색상 매핑)
     # ==========================================
     m1, m2, m3 = st.columns(3)
     m1.metric("💰 총 자산 합계", f"{total_asset:,.0f} 원", f"{total_diff:+,.0f} 원 ({total_pct:+.2f}%)", delta_color="inverse")
@@ -175,7 +173,7 @@ try:
     st.markdown("---")
 
     # ==========================================
-    # 📈 PART 2: 하이엔드 시각화 레이아웃 (타임라인 + 비중)
+    # 📈 PART 2: 하이엔드 비중 및 시계열 차트
     # ==========================================
     g1, g2 = st.columns([6, 4])
     
@@ -186,12 +184,13 @@ try:
         acc_col_hist = find_column(df_history, ['account', '계좌', '계좌구분'])
         
         if not df_history.empty and val_col_hist and date_col_hist and acc_col_hist:
-            df_history[date_col_hist] = pd.to_datetime(df_history[date_col_hist])
+            df_history[date_col_hist] = pd.to_datetime(df_history[date_col_hist], errors='coerce').dt.date
+            df_history[val_col_hist] = pd.to_numeric(df_history[val_col_hist].replace({',': ''}, regex=True), errors='coerce').fillna(0)
             df_timeline = df_history.groupby([date_col_hist, acc_col_hist])[val_col_hist].sum().unstack(fill_value=0)
             df_timeline['Total'] = df_timeline.sum(axis=1)
             st.line_chart(df_timeline)
         else:
-            st.info("📅 아직 데이터 축적량이 부족합니다. 내일 밤 정산 스크립트 실행 후 타임라인 곡선이 형성됩니다.")
+            st.info("📅 아직 데이터 축적량이 부족합니다. 역사 데이터 곡선이 곧 형성됩니다.")
 
     with g2:
         st.subheader("🍕 포트폴리오 자산 배분 비중")
@@ -219,62 +218,55 @@ try:
     st.markdown("---")
 
     # ==========================================
-    # 📊 PART 3: 💡 자산 세부 보유 현황 테이블 고도화 개편
+    # 📊 PART 3: 자산 세부 보유 현황 테이블 고도화
     # ==========================================
     st.subheader("📊 핵심 포트폴리오 스냅샷 (수익률 순 정렬)")
     if not df_portfolio.empty:
-        # 가시성을 지극히 높이기 위한 전용 포맷터 전처리 데이터프레임 가공
         df_display = pd.DataFrame()
-        df_display['종목코드'] = df_portfolio[ticker_col]
         df_display['종목명'] = df_portfolio[name_col].fillna(df_portfolio[ticker_col])
-        df_display['보유수량'] = df_portfolio[shares_col].apply(lambda x: f"{int(x):,}" if x.is_integer() else f"{x:,.2f}")
+        df_display['보유주식수'] = df_portfolio[shares_col].apply(lambda x: f"{int(x):,}" if x.is_integer() else f"{x:,.2f}")
         
-        # 통화별 단위 매핑
         df_display['매수가'] = df_portfolio.apply(lambda r: f"${r[avg_col]:,.2f}" if str(r[find_column(df_portfolio, ['currency', 'Currency'])]).upper() == 'USD' else f"{int(r[avg_col]):,}원", axis=1)
         df_display['현재가'] = df_portfolio.apply(lambda r: f"${r[price_col]:,.2f}" if str(r[find_column(df_portfolio, ['currency', 'Currency'])]).upper() == 'USD' else f"{int(r[price_col]):,}원", axis=1)
         
-        # 수익률 수치 저장 및 포맷팅 (정렬용)
-        df_display['_raw_roi'] = df_portfolio['수익률']
-        df_display['수익률'] = df_portfolio['수익률'].apply(lambda x: f"🔴 {x:+.2f}%" if x > 0 else f"🔵 {x:+.2f}%" if x < 0 else f"⚪ {x:.2f}%")
-        df_display['평가가치(원화)'] = df_portfolio['Total_Value_KRW'].apply(lambda x: f"{int(x):,} 원")
-        df_display['계좌'] = df_portfolio[find_column(df_portfolio, ['account', 'Account'])]
+        df_display['_raw_roi'] = df_portfolio['수익률_수치']
+        df_display['수익률'] = df_portfolio['수익률_수치'].apply(lambda x: f"🔺 {x:+.2f}%" if x > 0 else f"🔻 {x:+.2f}%" if x < 0 else f"▫️ {x:.2f}%")
+        df_display['평가가치'] = df_portfolio['Total_Value_KRW'].apply(lambda x: f"{int(x):,} 원")
+        df_display['계좌구분'] = df_portfolio[find_column(df_portfolio, ['account', 'Account'])]
         
-        # 💡 핵심 요청사항: 수익률(내림차순)로 데이터 정렬 및 인덱스 숨김
         df_display = df_display.sort_values(by='_raw_roi', ascending=False).drop(columns=['_raw_roi'])
         
-        account_tab1, account_tab2, account_tab3 = st.tabs(["전체 자산 현황", "일반 주식 자산", "연금저축/IRP 자산"])
+        account_tab1, account_tab2, account_tab3 = st.tabs(["전체 자산 스냅샷", "일반 주식 자산", "연금저축/IRP 자산"])
         with account_tab1:
             st.dataframe(df_display, use_container_width=True, hide_index=True)
         with account_tab2:
-            st.dataframe(df_display[df_display['계좌'] == '일반'], use_container_width=True, hide_index=True)
+            st.dataframe(df_display[df_display['계좌구분'] == '일반'], use_container_width=True, hide_index=True)
         with account_tab3:
-            st.dataframe(df_display[df_display['계좌'] == '연금'], use_container_width=True, hide_index=True)
+            st.dataframe(df_display[df_display['계좌구분'] == '연금'], use_container_width=True, hide_index=True)
     else:
         st.info("조회할 세부 장부가 비어 있습니다.")
 
     # ==========================================
-    # 🤖 PART 4: 💡 AI 리포트 브리핑 룸 포맷 일치화 개편
+    # 🤖 PART 4: AI 리포트 브리핑 룸 포맷 일치화
     # ==========================================
     st.markdown("---")
-    st.subheader("🤖 AI 리포트 브리핑 룸 (Hedge Fund Layout)")
+    st.subheader("🤖 AI 리포트 브리핑 룸 (Hedge Fund Consensus)")
     if latest_ai_report is not None:
-        st.caption(f"📅 리포트 릴리즈 시점: {latest_ai_report.get('Date', 'N/A')}")
+        st.caption(f"📅 리포트 공시 시점: {latest_ai_report.get('Date', 'N/A')}")
         
         tab1, tab2, tab3, tab4 = st.tabs(["📉 퀀트 (Quant)", "🌍 매크로 (Macro)", "💎 가치투자 (Value)", "🚀 텐베거 (10-Bagger)"])
         
-        # 💡 깔끔하고 일관성 있는 금융 리포트 마크다운 구조로 일치화 렌더링
-        def render_opinion(title, content):
-            st.markdown(f"### 📋 {title} 심층 분석")
-            st.markdown(f"> **Executive Summary:** 본 리포트는 구글 시트 거래 원장 및 마스터 팩터를 연동하여 산출된 결과입니다.")
-            st.markdown("---")
-            st.markdown(content)
-            st.markdown("---")
-            st.caption("⚠️ 본 분석은 투자 보조 인프라 데이터이며, 최종 투자 책임은 본인에게 있습니다.")
+        def render_structured_report(title, raw_content):
+            st.markdown(f"### 📋 {title} 부문 정밀 컨센서스")
+            st.markdown("<div class='report-box'>", unsafe_allow_html=True)
+            st.markdown(f"**📢 주요 권고사항 및 전략적 포지셔닝**\n\n{raw_content}")
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.caption("ℹ️ 해당 리포트는 데이터 마스터 팩터 알고리즘에 의해 자동 생성된 보조 지표입니다.")
 
-        with tab1: render_opinion("퀀트 포지셔닝 의견", latest_ai_report.get('Quant_Opinion', '데이터 없음'))
-        with tab2: render_opinion("글ローバル 매크로 의견", latest_ai_report.get('Macro_Opinion', '데이터 없음'))
-        with tab3: render_opinion("밸류에이션 가치투자 의견", latest_ai_report.get('Value_Opinion', '데이터 없음'))
-        with tab4: render_opinion("혁신성장 텐베거 탐색 의견", latest_ai_report.get('Ten_Bagger_Opinion', '데이터 없음'))
+        with tab1: render_structured_report("시스템 퀀트 분석", latest_ai_report.get('Quant_Opinion', '브리핑 데이터가 업데이트되지 않았습니다.'))
+        with tab2: render_structured_report("글로벌 매크로 환경 분석", latest_ai_report.get('Macro_Opinion', '브리핑 데이터가 업데이트되지 않았습니다.'))
+        with tab3: render_structured_report("기본적 가치 및 마진 분석", latest_ai_report.get('Value_Opinion', '브리핑 데이터가 업데이트되지 않았습니다.'))
+        with tab4: render_structured_report("혁신 도출 텐베거 분석", latest_ai_report.get('Ten_Bagger_Opinion', '브리핑 데이터가 업데이트되지 않았습니다.'))
 
 except Exception as e:
     st.error("대시보드 엔진 구동 중 예외가 발생했습니다.")
