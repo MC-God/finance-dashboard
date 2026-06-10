@@ -120,6 +120,12 @@ try:
     with st.spinner("데이터 동기화 중..."):
         df_port_raw, df_hist_raw, latest_ai_report = load_data()
 
+    # =========== [여기에 디버깅 코드 추가] ===========
+    with st.expander("🛠️ 디버깅: History 시트 데이터 구조 확인"):
+        st.write("현재 대시보드가 인식한 컬럼명:", df_hist_raw.columns.tolist())
+        st.dataframe(df_hist_raw.head())
+    # ===================================================
+
     # --- KPI 및 포트폴리오 연산 ---
     total_asset, normal_asset, pension_asset = 0, 0, 0
     total_diff, total_pct = calc_delta(df_hist_raw)
