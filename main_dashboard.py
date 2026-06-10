@@ -146,11 +146,11 @@ try:
     # --- 공통 렌더링 함수 (빨강=상승, 파랑=하락 전역 통일) ---
     def render_card(title, value, diff, pct=None, unit="원"):
         if diff > 0:
-            color, arrow, sign = "#FF4B4B", "🔺", "+"
+            color, arrow, sign = "#FF4B4B", "▲", "+"
         elif diff < 0:
-            color, arrow, sign = "#1C83E1", "🔻", ""
+            color, arrow, sign = "#1C83E1", "▼", ""
         else:
-            color, arrow, sign = "#888888", "▫️", ""
+            color, arrow, sign = "#888888", "-", ""
             
         value_fmt = f"{value:,.0f}" if unit == "원" else f"{value:.2f}"
         diff_fmt = f"{diff:,.0f} {unit}" if unit == "원" else f"{diff:.2f}%p"
@@ -171,13 +171,7 @@ try:
     @st.cache_data(ttl=3600)
     def fetch_macro_indicators():
         try:
-            # yfinance 하나로 모든 데이터 추출 (호환성 에러 원천 차단)
-            tickers = {
-                "5Y": "^FVX",
-                "10Y": "^TNX",
-                "30Y": "^TYX",
-                "VIX": "^VIX"
-            }
+            tickers = {"5Y": "^FVX", "10Y": "^TNX", "30Y": "^TYX", "VIX": "^VIX"}
             res = {}
             for name, t in tickers.items():
                 df = yf.Ticker(t).history(period="2d")
@@ -263,17 +257,35 @@ try:
         df_display['현재가'] = df_port.apply(lambda r: f"${r['Current_Price']:,.2f}" if r['Currency'] == 'USD' else f"{int(r['Current_Price']):,}원", axis=1)
         
         df_display['ROI_Val'] = df_port['ROI']
-        # 하락 파랑 🔻, 상승 빨강 🔺 전역 통일 적용
-        df_display['수익률'] = df_port['ROI'].apply(lambda x: f"🔺 +{x:.2f}%" if x > 0 else f"🔻 {x:.2f}%" if x < 0 else f"▫️ {x:.2f}%")
+        
+        # OS의 강제 색상을 회피하기 위해 이모지가 아닌 순수 텍스트 기호 사용
+        df_display['수익률'] = df_port['ROI'].apply(lambda x: f"▲ +{x:.2f}%" if x > 0 else f"▼ {x:.2f}%" if x < 0 else f"- {x:.2f}%")
         df_display['평가가치'] = df_port['Total_Value_KRW'].apply(lambda x: f"{int(x):,} 원")
         df_display['계좌'] = df_port['Account']
         
         df_display = df_display.sort_values(by='ROI_Val', ascending=False).drop(columns=['ROI_Val'])
         
+        # Pandas Styler를 활용해 HTML 레벨에서 진짜 파란색과 빨간색을 강제 주입
+        def style_roi(val):
+            if '▲' in str(val):
+                return 'color: #FF4B4B; font-weight: bold;'
+            elif '▼' in str(val):
+                return 'color: #1C83E1; font-weight: bold;'
+            return 'color: #888888;'
+            
+        style_func = df_display.style.map if hasattr(df_display.style, 'map') else df_display.style.applymap
+        
         tab1, tab2, tab3 = st.tabs(["전체", "일반", "연금"])
-        with tab1: st.dataframe(df_display, use_container_width=True, hide_index=True)
-        with tab2: st.dataframe(df_display[df_display['계좌'] == '일반'], use_container_width=True, hide_index=True)
-        with tab3: st.dataframe(df_display[df_display['계좌'] == '연금'], use_container_width=True, hide_index=True)
+        with tab1: 
+            st.dataframe(style_func(style_roi, subset=['수익률']), use_container_width=True, hide_index=True)
+        with tab2: 
+            df_normal = df_display[df_display['계좌'] == '일반']
+            s_func = df_normal.style.map if hasattr(df_normal.style, 'map') else df_normal.style.applymap
+            st.dataframe(s_func(style_roi, subset=['수익률']), use_container_width=True, hide_index=True)
+        with tab3: 
+            df_pension = df_display[df_display['계좌'] == '연금']
+            s_func = df_pension.style.map if hasattr(df_pension.style, 'map') else df_pension.style.applymap
+            st.dataframe(s_func(style_roi, subset=['수익률']), use_container_width=True, hide_index=True)
     else:
         st.info("조회할 장부가 비어 있습니다.")
 
