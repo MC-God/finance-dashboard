@@ -14,8 +14,6 @@ st.set_page_config(page_title="Hedge Fund Style Cockpit", page_icon="🏦", layo
 # 가시성 극대화를 위한 전용 컴팩트 스타일 주입
 st.markdown("""
     <style>
-    div[data-testid="stMetric"] { background-color: #1e222b; padding: 15px; border-radius: 8px; border: 1px solid #2e3440; }
-    div[data-testid="stMetricLabel"] { font-size: 14px !important; color: #b0b5c0 !important; }
     .report-box { background-color: #1a1c23; padding: 20px; border-radius: 8px; border-left: 5px solid #FF4B4B; margin-bottom: 15px; }
     </style>
 """, unsafe_allow_html=True)
@@ -41,18 +39,22 @@ def get_usd_krw_rate():
         pass
     return 1350.0
 
+# 💡 [핵심 교정] get_all_records 대신 get_all_values를 사용하여 에러 원천 차단
 @st.cache_data(ttl=30)
 def load_all_dashboard_data():
     client = get_sheet_client()
     doc = client.open_by_key(SPREADSHEET_ID)
     
-    portfolio_records = doc.worksheet("Portfolio").get_all_records()
-    df_portfolio = pd.DataFrame(portfolio_records)
+    # Portfolio 로드
+    portfolio_vals = doc.worksheet("Portfolio").get_all_values()
+    df_portfolio = pd.DataFrame(portfolio_vals[1:], columns=portfolio_vals[0]) if len(portfolio_vals) > 1 else pd.DataFrame()
     
+    # History 로드 (절대 실패하지 않는 파싱 방식)
     df_history = pd.DataFrame()
     try:
-        history_records = doc.worksheet("History").get_all_records()
-        df_history = pd.DataFrame(history_records)
+        history_vals = doc.worksheet("History").get_all_values()
+        if len(history_vals) > 1:
+            df_history = pd.DataFrame(history_vals[1:], columns=history_vals[0])
     except Exception:
         pass
         
@@ -71,6 +73,7 @@ def find_column(df, possible_names):
                 return col
     return None
 
+# --- 대시보드 렌더링 ---
 st.title("🏦 포트폴리오 자산 운용 콕핏")
 
 try:
@@ -80,7 +83,7 @@ try:
     with st.spinner("인프라 데이터 동기화 중..."):
         df_portfolio, df_history, latest_ai_report = load_all_dashboard_data()
 
-    # --- 💡 전일 대비 증감 연산 철통 방어 로직 ---
+    # --- 전일 대비 증감 연산 로직 ---
     def get_delta_fixed(df_h, account_filter=None):
         if df_h is None or df_h.empty: 
             return 0, 0
@@ -94,10 +97,9 @@ try:
             
         try:
             df_h_clean = df_h.copy()
-            # 💡 구글 시트의 날짜 포맷이 어떤 형태든 완벽하게 파이썬 날짜(Date) 객체로 강제 정규화
             df_h_clean['parsed_date'] = pd.to_datetime(df_h_clean[date_col], errors='coerce').dt.date
-            # 문자열 등 오류로 인한 NaT(결측치) 제거 후 오름차순 정렬
-            unique_dates = sorted(df_h_clean['parsed_date'].dropna().unique())
+            df_h_clean = df_h_clean.dropna(subset=['parsed_date'])
+            unique_dates = sorted(df_h_clean['parsed_date'].unique())
             
             if len(unique_dates) < 2: 
                 return 0, 0
@@ -105,8 +107,8 @@ try:
             latest_date = unique_dates[-1]
             prev_date = unique_dates[-2]
             
-            # 가치 산정 시 구글 시트 특유의 콤마(,) 텍스트 무력화
-            df_h_clean[val_col] = pd.to_numeric(df_h_clean[val_col].replace({',': ''}, regex=True), errors='coerce').fillna(0)
+            # 구글 시트 특유의 콤마(,) 텍스트 무력화
+            df_h_clean[val_col] = pd.to_numeric(df_h_clean[val_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
             
             def sum_val_for_date(target_date):
                 target_df = df_h_clean[df_h_clean['parsed_date'] == target_date]
@@ -137,9 +139,9 @@ try:
     pension_diff, pension_pct = get_delta_fixed(df_history, "연금")
 
     if not df_portfolio.empty and ticker_col and shares_col and price_col and avg_col:
-        df_portfolio[shares_col] = pd.to_numeric(df_portfolio[shares_col], errors='coerce').fillna(0)
-        df_portfolio[price_col] = pd.to_numeric(df_portfolio[price_col], errors='coerce').fillna(0)
-        df_portfolio[avg_col] = pd.to_numeric(df_portfolio[avg_col], errors='coerce').fillna(0)
+        df_portfolio[shares_col] = pd.to_numeric(df_portfolio[shares_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+        df_portfolio[price_col] = pd.to_numeric(df_portfolio[price_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+        df_portfolio[avg_col] = pd.to_numeric(df_portfolio[avg_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
         
         if not curr_col: df_portfolio['Currency'] = df_portfolio[ticker_col].apply(lambda x: 'USD' if str(x).isalpha() else 'KRW')
         if not acc_col: df_portfolio['Account'] = '일반'
@@ -163,14 +165,31 @@ try:
         pension_asset = df_portfolio[df_portfolio[find_column(df_portfolio, ['account', 'Account'])] == '연금']['Total_Value_KRW'].sum()
 
     # ==========================================
-    # 💰 PART 1: KPI 전광판 메트릭 (한국 주식 관습 색상 매핑)
+    # 💰 PART 1: 💡 커스텀 HTML KPI 전광판 (절대 짤리지 않는 완벽한 폼)
     # ==========================================
-    m1, m2, m3 = st.columns(3)
-    m1.metric("💰 총 자산 합계", f"{total_asset:,.0f} 원", f"{total_diff:+,.0f} 원 ({total_pct:+.2f}%)", delta_color="inverse")
-    m2.metric("💵 일반 주식계좌 자산", f"{normal_asset:,.0f} 원", f"{normal_diff:+,.0f} 원 ({normal_pct:+.2f}%)", delta_color="inverse")
-    m3.metric("🛡️ 연금저축/IRP 자산", f"{pension_asset:,.0f} 원", f"{pension_diff:+,.0f} 원 ({pension_pct:+.2f}%)", delta_color="inverse")
+    def render_metric_card(title, value, diff, pct):
+        if diff > 0:
+            color, arrow, sign = "#FF4B4B", "🔺", "+"
+        elif diff < 0:
+            color, arrow, sign = "#1C83E1", "🔻", ""
+        else:
+            color, arrow, sign = "#888888", "▫️", "+"
+            
+        html = f"""
+        <div style="background-color: #1e222b; padding: 20px; border-radius: 8px; border: 1px solid #2e3440; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
+            <p style="color: #b0b5c0; font-size: 15px; margin-bottom: 5px; font-weight: 600;">{title}</p>
+            <h2 style="color: white; margin: 0; font-size: 32px; letter-spacing: -0.5px;">{value:,.0f} <span style="font-size:16px; font-weight:normal; color:#888;">원</span></h2>
+            <p style="color: {color}; margin-top: 8px; font-size: 15px; margin-bottom: 0; font-weight: 500;">{arrow} {sign}{diff:,.0f} 원 ({sign}{pct:.2f}%)</p>
+        </div>
+        """
+        return html
 
-    st.markdown("---")
+    m1, m2, m3 = st.columns(3)
+    with m1: st.markdown(render_metric_card("💰 총 자산 합계", total_asset, total_diff, total_pct), unsafe_allow_html=True)
+    with m2: st.markdown(render_metric_card("💵 일반 주식계좌 자산", normal_asset, normal_diff, normal_pct), unsafe_allow_html=True)
+    with m3: st.markdown(render_metric_card("🛡️ 연금저축/IRP 자산", pension_asset, pension_diff, pension_pct), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
 
     # ==========================================
     # 📈 PART 2: 하이엔드 비중 및 시계열 차트
@@ -184,11 +203,17 @@ try:
         acc_col_hist = find_column(df_history, ['account', '계좌', '계좌구분'])
         
         if not df_history.empty and val_col_hist and date_col_hist and acc_col_hist:
-            df_history[date_col_hist] = pd.to_datetime(df_history[date_col_hist], errors='coerce').dt.date
-            df_history[val_col_hist] = pd.to_numeric(df_history[val_col_hist].replace({',': ''}, regex=True), errors='coerce').fillna(0)
-            df_timeline = df_history.groupby([date_col_hist, acc_col_hist])[val_col_hist].sum().unstack(fill_value=0)
-            df_timeline['Total'] = df_timeline.sum(axis=1)
-            st.line_chart(df_timeline)
+            try:
+                df_h_chart = df_history.copy()
+                df_h_chart[date_col_hist] = pd.to_datetime(df_h_chart[date_col_hist], errors='coerce').dt.date
+                df_h_chart = df_h_chart.dropna(subset=[date_col_hist])
+                df_h_chart[val_col_hist] = pd.to_numeric(df_h_chart[val_col_hist].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+                
+                df_timeline = df_h_chart.groupby([date_col_hist, acc_col_hist])[val_col_hist].sum().unstack(fill_value=0)
+                df_timeline['총자산'] = df_timeline.sum(axis=1)
+                st.line_chart(df_timeline)
+            except Exception as e:
+                st.error(f"차트 렌더링 중 오류: {e}")
         else:
             st.info("📅 아직 데이터 축적량이 부족합니다. 역사 데이터 곡선이 곧 형성됩니다.")
 
@@ -212,7 +237,7 @@ try:
             
             fig = px.pie(pie_data, values='Total_Value_KRW', names='Category', hole=0.4,
                          color_discrete_sequence=['#FF4B4B', '#1C83E1', '#FBC02D'])
-            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True)
+            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
             st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
@@ -224,7 +249,7 @@ try:
     if not df_portfolio.empty:
         df_display = pd.DataFrame()
         df_display['종목명'] = df_portfolio[name_col].fillna(df_portfolio[ticker_col])
-        df_display['보유주식수'] = df_portfolio[shares_col].apply(lambda x: f"{int(x):,}" if x.is_integer() else f"{x:,.2f}")
+        df_display['보유주식수'] = df_portfolio[shares_col].apply(lambda x: f"{int(x):,}" if float(x).is_integer() else f"{x:,.2f}")
         
         df_display['매수가'] = df_portfolio.apply(lambda r: f"${r[avg_col]:,.2f}" if str(r[find_column(df_portfolio, ['currency', 'Currency'])]).upper() == 'USD' else f"{int(r[avg_col]):,}원", axis=1)
         df_display['현재가'] = df_portfolio.apply(lambda r: f"${r[price_col]:,.2f}" if str(r[find_column(df_portfolio, ['currency', 'Currency'])]).upper() == 'USD' else f"{int(r[price_col]):,}원", axis=1)
@@ -247,7 +272,7 @@ try:
         st.info("조회할 세부 장부가 비어 있습니다.")
 
     # ==========================================
-    # 🤖 PART 4: AI 리포트 브리핑 룸 포맷 일치화
+    # 🤖 PART 4: AI 리포트 브리핑 룸
     # ==========================================
     st.markdown("---")
     st.subheader("🤖 AI 리포트 브리핑 룸 (Hedge Fund Consensus)")
