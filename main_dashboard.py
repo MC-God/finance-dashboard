@@ -75,8 +75,10 @@ def load_data():
 # 3. 데이터 정제 및 연산 엔진
 # ==========================================
 def clean_numeric(series):
-    """문자열에 섞인 콤마를 제거하고 숫자로 강제 변환"""
-    return pd.to_numeric(series.astype(str).str.replace(',', '').str.strip(), errors='coerce').fillna(0)
+    """문자열에 섞인 콤마, 통화 기호 등을 제거하고 숫자로 강제 변환"""
+    # 정규식을 사용해 숫자(\d), 소수점(\.), 음수 기호(-)만 남기고 전부 제거
+    cleaned = series.astype(str).str.replace(r'[^\d\.-]', '', regex=True)
+    return pd.to_numeric(cleaned, errors='coerce').fillna(0)
 
 def calc_delta(df_hist, account_type=None):
     """History 데이터를 바탕으로 전일 대비 증감액 계산"""
@@ -85,28 +87,26 @@ def calc_delta(df_hist, account_type=None):
         
     df = df_hist.copy()
     
-    # 1. 날짜 및 금액 정제
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+    # dt.date 대신 dt.normalize() 사용 (Streamlit 호환성 확보)
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
     df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
     df = df.dropna(subset=['Date'])
     
-    # 2. 계좌 필터링
     if account_type and 'Account' in df.columns:
         df = df[df['Account'].str.strip() == account_type]
         
-    # 3. 날짜별 총합 연산
     daily_sum = df.groupby('Date')['Total_Value_KRW'].sum().sort_index()
     
     if len(daily_sum) < 2:
         return 0, 0
         
-    # 4. 비교
     latest_val = daily_sum.iloc[-1]
     prev_val = daily_sum.iloc[-2]
     
     diff = latest_val - prev_val
     pct = (diff / prev_val * 100) if prev_val != 0 else 0
     return diff, pct
+
 
 # ==========================================
 # 4. 대시보드 렌더링
@@ -168,13 +168,23 @@ try:
     # --- PART 2: 시계열 및 비중 차트 ---
     g1, g2 = st.columns([6, 4])
     
+        # --- PART 2: 시계열 및 비중 차트 ---
+    g1, g2 = st.columns([6, 4])
+    
     with g1:
         st.subheader("📈 자산 성장 타임라인")
         if not df_hist_raw.empty and 'Date' in df_hist_raw.columns and 'Total_Value_KRW' in df_hist_raw.columns:
             df_chart = df_hist_raw.copy()
-            df_chart['Date'] = pd.to_datetime(df_chart['Date'], errors='coerce').dt.date
+            
+            # 여기도 dt.date 대신 dt.normalize() 적용
+            df_chart['Date'] = pd.to_datetime(df_chart['Date'], errors='coerce').dt.normalize()
             df_chart['Total_Value_KRW'] = clean_numeric(df_chart['Total_Value_KRW'])
-            df_chart['Account'] = df_chart.get('Account', '일반').astype(str).str.strip()
+            
+            # df_chart.get 오류 방지를 위해 기본값 부여 방식 안전하게 변경
+            if 'Account' not in df_chart.columns:
+                df_chart['Account'] = '일반'
+            df_chart['Account'] = df_chart['Account'].astype(str).str.strip()
+            
             df_chart = df_chart.dropna(subset=['Date'])
             
             if not df_chart.empty:
