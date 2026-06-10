@@ -5,3 +5,4 @@ finance-datareader
 google-genai
 streamlit
 python-telegram-bot
+yfinance==0.2.37

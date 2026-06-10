@@ -4,6 +4,8 @@ import json
 import pandas as pd
 import requests
 import math
+import pickle
+import time
 import FinanceDataReader as fdr
 from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
@@ -12,7 +14,6 @@ from src.sheets_client import get_sheet_client
 load_dotenv()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
-# 🇺🇸 미국 주식 및 대표 ETF 고정 표준 매핑 소스
 US_STOCK_NAME_REGISTRY = {
     '0013P0': 'RISE 미국은행TOP10', 
     'TSLA': '테슬라', 'AAPL': '애플', 'NVDA': '엔비디아', 'MSFT': '마이크로소프트',
@@ -46,17 +47,46 @@ def get_usd_krw_rate():
 
 def get_kst_now():
     utc_now = datetime.datetime.now(datetime.timezone.utc)
-    kst_now = utc_now + datetime.timedelta(hours=9)
-    return kst_now
+    return utc_now + datetime.timedelta(hours=9)
 
 def clean_float(val):
     if math.isnan(val) or math.isinf(val):
         return 0.0
     return val
 
+def get_cached_registry():
+    """KRX/ETF 종목 레지스트리를 캐싱하여 로딩 속도 10배 향상"""
+    cache_file = "krx_etf_cache.pkl"
+    cache_expiry = 259200 # 3일
+
+    if os.path.exists(cache_file) and time.time() - os.path.getmtime(cache_file) < cache_expiry:
+        print("📦 로컬 캐시에서 마스터 레지스트리를 불러옵니다 (속도 최적화 적용).")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+
+    print("🌐 마스터 레지스트리 새로 다운로드 중...")
+    krx_name_registry = {}
+    try:
+        df_krx = fdr.StockListing('KRX')
+        krx_name_registry.update(dict(zip(df_krx['Code'].astype(str), df_krx['Name'].astype(str))))
+        
+        df_etf = fdr.StockListing('ETF/KR')
+        code_col = 'Symbol' if 'Symbol' in df_etf.columns else 'Code' if 'Code' in df_etf.columns else df_etf.columns[0]
+        name_col = 'Name' if 'Name' in df_etf.columns else df_etf.columns[1]
+        
+        etf_registry = dict(zip(df_etf[code_col].astype(str), df_etf[name_col].astype(str)))
+        krx_name_registry.update(etf_registry)
+        
+        with open(cache_file, 'wb') as f:
+            pickle.dump(krx_name_registry, f)
+    except Exception as e:
+        print(f"⚠️ 레지스트리 로드 실패: {e}")
+        
+    return krx_name_registry
+
 def run_portfolio_settlement():
     kst_now = get_kst_now()
-    print(f"[{kst_now}] 🔄 [미국주식 NaN 방어 탑재] 대한민국 표준시(KST) 기준 자산 정산 엔진 구동...")
+    print(f"[{kst_now}] 🔄 대한민국 표준시(KST) 기준 자산 정산 엔진 구동...")
     
     try:
         sheet_client = get_sheet_client()
@@ -70,25 +100,7 @@ def run_portfolio_settlement():
             print("⚠️ 거래 기록이 비어있어 정산을 종료합니다.")
             return
             
-        krx_name_registry = {}
-        
-        print("📋 한국거래소(KRX) 상장 주식 마스터 레지스트리 동기화 중...")
-        try:
-            df_krx = fdr.StockListing('KRX')
-            krx_name_registry.update(dict(zip(df_krx['Code'].astype(str), df_krx['Name'].astype(str))))
-        except Exception as e:
-            print(f"⚠️ KRX 주식 레지스트리 로드 실패: {e}")
-            
-        print("📋 대한민국 상장 ETF 마스터 레지스트리 추가 연동 및 병합 중...")
-        try:
-            df_etf = fdr.StockListing('ETF/KR')
-            code_col = 'Symbol' if 'Symbol' in df_etf.columns else 'Code' if 'Code' in df_etf.columns else df_etf.columns[0]
-            name_col = 'Name' if 'Name' in df_etf.columns else df_etf.columns[1]
-            
-            etf_registry = dict(zip(df_etf[code_col].astype(str), df_etf[name_col].astype(str)))
-            krx_name_registry.update(etf_registry)
-        except Exception as e:
-            print(f"⚠️ 국내 ETF 레지스트리 로드 실패: {e}")
+        krx_name_registry = get_cached_registry()
         
         holdings = {}
         for row in tx_records:
@@ -159,9 +171,7 @@ def run_portfolio_settlement():
             try:
                 df_stock = fdr.DataReader(ticker, start=start_str)
                 if df_stock is not None and not df_stock.empty:
-                    # 💡 [핵심 방어 코드] 야후 파이낸스 특유의 종가(Close) 결측치(NaN) 더미 행을 완벽히 삭제
                     df_stock = df_stock.dropna(subset=['Close'])
-                    
                     if len(df_stock) >= 1:
                         current_price = float(df_stock.iloc[-1]['Close'])
                         if len(df_stock) >= 2:
@@ -187,9 +197,6 @@ def run_portfolio_settlement():
         if portfolio_rows:
             port_sheet.append_rows(portfolio_rows)
             
-        # ==============================================================
-        # [수정 2] History 시트 구조 보호 및 갱신 로직 (헤더 누락 완벽 방어)
-        # ==============================================================
         try:
             hist_sheet = doc.worksheet("History")
         except Exception:
@@ -198,31 +205,27 @@ def run_portfolio_settlement():
         hist_header = ["Date", "Ticker", "Stock_Name", "Total_Value_KRW", "Account"]
         all_hist_values = hist_sheet.get_all_values()
         
-        # 헤더 방어 로직: 시트가 완전히 비었거나 헤더가 다르면 초기 세팅
         if not all_hist_values or all_hist_values[0][0] != "Date":
             hist_sheet.insert_row(hist_header, index=1)
             
         all_hist_records = hist_sheet.get_all_records()
         
-        # 당일 데이터 중복 갱신을 위해 어제까지의 데이터만 남기기
         if all_hist_records:
             df_hist_temp = pd.DataFrame(all_hist_records)
             if 'Date' in df_hist_temp.columns:
                 df_keep = df_hist_temp[df_hist_temp['Date'].astype(str).str.strip() != today_str]
                 hist_sheet.clear()
-                hist_sheet.append_row(hist_header) # 클리어 후 무조건 헤더부터 다시 삽입
+                hist_sheet.append_row(hist_header)
                 if not df_keep.empty:
                     hist_sheet.append_rows(df_keep.values.tolist())
         else:
-            # 기록이 하나도 없었다면 클리어 후 헤더만 삽입
             hist_sheet.clear()
             hist_sheet.append_row(hist_header)
 
-        # 오늘 정산된 새로운 데이터 추가
         if history_rows:
             hist_sheet.append_rows(history_rows)
 
-        print(f"✅ [미국 주식 시세 복원 및 헤더 방어 완료] {today_str} 일자 정산 및 갱신 성공!")
+        print(f"✅ [자산 정산 및 시세 복원 완료] {today_str} 일자 정산 및 갱신 성공!")
 
     except Exception as e:
         print(f"❌ 정산 엔진 가동 중 시스템 예외 발생: {e}")

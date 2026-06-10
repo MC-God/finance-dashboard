@@ -1,9 +1,11 @@
-import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
 import os
 import json
+import re
 import datetime
+import asyncio
+from functools import wraps
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -15,22 +17,48 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 💡 회원님의 공식 스트림릿 대시보드 주소로 완벽하게 수정 반영했습니다!
+# 허용된 사용자 ID 리스트 파싱
+ALLOWED_USER_IDS = [
+    int(uid.strip()) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()
+]
+
 DASHBOARD_URL = "https://finance-dashboard-mcgod.streamlit.app"
 
+def restricted(func):
+    """지정된 USER_ID만 봇을 사용할 수 있도록 막는 보안 데코레이터"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            if update.message:
+                await update.message.reply_text("⛔ [보안 차단] 허가되지 않은 사용자입니다.")
+            elif update.callback_query:
+                await update.callback_query.answer("⛔ 권한이 없습니다.", show_alert=True)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+def extract_json_from_text(text: str):
+    """AI 응답 텍스트에서 정규식을 이용해 순수 JSON 데이터만 안전하게 추출"""
+    cleaned = re.sub(r'```json\n|```', '', text).strip()
+    match = re.search(r'(\[.*\]|\{.*\})', cleaned, re.DOTALL)
+    if match:
+        return json.loads(match.group(1))
+    return json.loads(cleaned)
+
+@restricted
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
-        "안녕하세요! AI 투자 어시스턴트입니다.\n\n"
+        "안녕하세요! 프라이빗 AI 투자 어시스턴트입니다.\n\n"
         "👇 아래 버튼을 눌러 대시보드를 확인하거나 명령어를 입력해 보세요.\n"
         "- /ai : 오늘의 4인방 AI 심층 분석 리포트 확인\n"
         "📸 보유 주식 현황 스크린샷을 보내주시면 자동으로 판독하여 시트에 입력해 드립니다!"
     )
-    # 구글 보안 정책 우회를 위해 외부 브라우저(사파리/크롬) 주소 호출 구조 고수
     keyboard = [[InlineKeyboardButton("📈 내 포트폴리오 대시보드 열기", url=DASHBOARD_URL)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(welcome_msg, reply_markup=reply_markup)
 
-# --- 📸 이미지 캡처본 분석 핸들러 ---
+@restricted
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 이미지를 분석하여 표준 코드로 변환 중입니다... (약 5~10초 소요)")
     
@@ -43,8 +71,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         ⚠️ [필수 변환 규칙]
         1. ticker: FinanceDataReader가 인식할 수 있는 표준 코드로 변환해야 해.
-           - 한국 주식: 반드시 6자리 숫자 종목코드 (예: 삼성전자는 "005930", 현대차는 "005380")
-           - 미국 주식: 반드시 영문 대문자 티커 기호 (예: Apple은 "AAPL", Tesla는 "TSLA", NVDA 등)
+           - 한국 주식: 반드시 6자리 숫자 종목코드 (예: 삼성전자는 "005930")
+           - 미국 주식: 반드시 영문 대문자 티커 기호 (예: Apple은 "AAPL")
         2. currency: 해당 주식의 거래 통화를 판별해줘.
            - 한국 주식 상장이면 "KRW"
            - 미국 주식 상장이면 "USD"
@@ -60,14 +88,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         response = ai_client.models.generate_content(
             model='gemini-3.5-flash',
-            contents=[
-                types.Part.from_bytes(data=bytes(photo_bytes), mime_type="image/jpeg"),
-                prompt
-            ],
+            contents=[types.Part.from_bytes(data=bytes(photo_bytes), mime_type="image/jpeg"), prompt],
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         
-        parsed_stocks = json.loads(response.text)
+        parsed_stocks = extract_json_from_text(response.text)
         
         if not parsed_stocks:
             await update.message.reply_text("❌ 이미지에서 주식 보유 정보를 찾지 못했습니다.")
@@ -94,7 +119,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ 이미지 파싱 중 오류가 발생했습니다: {e}")
 
-# --- 버튼 클릭 처리 핸들러 (Callback Query) ---
+@restricted
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -114,7 +139,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if not stocks:
         await query.edit_message_text("❌ 저장할 데이터가 존재하지 않습니다.")
         return
-        
+    
     try:
         await query.edit_message_text(f"📥 구글 시트({action} 계좌)에 표준 데이터 기록 중...")
         
@@ -124,7 +149,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         tx_sheet = doc.worksheet("Transaction")
         
         for stock in stocks:
-            # 구글 시트 실제 컬럼 헤더 순서 반영: Account가 6번째, Currency가 7번째
             new_row = [
                 today_date, 
                 "매수", 
@@ -142,13 +166,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         await query.edit_message_text(f"❌ 구글 시트 저장 중 예외 발생: {e}")
 
+@restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await update.message.reply_text("🤖 입력하신 내용을 분석 중입니다...")
     
     prompt = f"""
     사용자의 입력을 분석하여 의도(intent)를 파악하고, 결과를 오직 JSON 형식으로만 반환해.
-    
     ⚠️ [필수 변환 규칙]
     1. ticker: 한국 주식은 6자리 숫자 코드, 미국 주식은 영문 대문자 티커로 변환해.
     2. currency: 한국 주식이면 "KRW", 미국 주식이면 "USD"로 판별해.
@@ -171,7 +195,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        data = json.loads(response.text)
+        data = extract_json_from_text(response.text)
         intent = data.get("intent", "unknown")
         
         if intent == "view_portfolio":
@@ -202,6 +226,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"처리 중 오류가 발생했습니다: {e}")
 
+@restricted
 async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("데이터를 불러오는 중입니다... 🔄")
     try:

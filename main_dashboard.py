@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import json
 import requests
+import yfinance as yf
 import plotly.express as px
 from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
@@ -37,27 +38,28 @@ def get_usd_krw_rate():
     try:
         res = requests.get("https://open.er-api.com/v6/latest/USD", timeout=3)
         if res.status_code == 200: return float(res.json()["rates"]["KRW"])
-    except: pass
+    except: 
+        pass
     return 1350.0
 
 # ==========================================
-# 2. 데이터 로드 (가장 단순하고 확실한 방법)
+# 2. 데이터 로드 
 # ==========================================
 @st.cache_data(ttl=30)
 def load_data():
     client = get_sheet_client()
     doc = client.open_by_key(SPREADSHEET_ID)
     
-    # 순수 텍스트 배열로 가져와서 DataFrame으로 변환
     def fetch_sheet(name):
         try:
-            vals = doc.worksheet(name).get_all_values()
-            if len(vals) > 1:
-                df = pd.DataFrame(vals[1:], columns=vals[0])
-                df.columns = df.columns.str.strip() # 헤더 공백 제거
-                return df
-            return pd.DataFrame()
-        except:
+            worksheet = doc.worksheet(name)
+            vals = worksheet.get_all_values()
+            if not vals:
+                return pd.DataFrame()
+            df = pd.DataFrame(vals[1:], columns=vals[0])
+            df.columns = df.columns.astype(str).str.strip()
+            return df
+        except Exception:
             return pd.DataFrame()
 
     df_port = fetch_sheet("Portfolio")
@@ -76,7 +78,6 @@ def load_data():
 # ==========================================
 def clean_numeric(series):
     """문자열에 섞인 콤마, 통화 기호 등을 제거하고 숫자로 강제 변환"""
-    # 정규식을 사용해 숫자(\d), 소수점(\.), 음수 기호(-)만 남기고 전부 제거
     cleaned = series.astype(str).str.replace(r'[^\d\.-]', '', regex=True)
     return pd.to_numeric(cleaned, errors='coerce').fillna(0)
 
@@ -87,7 +88,6 @@ def calc_delta(df_hist, account_type=None):
         
     df = df_hist.copy()
     
-    # dt.date 대신 dt.normalize() 사용 (Streamlit 호환성 확보)
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
     df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
     df = df.dropna(subset=['Date'])
@@ -107,7 +107,6 @@ def calc_delta(df_hist, account_type=None):
     pct = (diff / prev_val * 100) if prev_val != 0 else 0
     return diff, pct
 
-
 # ==========================================
 # 4. 대시보드 렌더링
 # ==========================================
@@ -120,12 +119,6 @@ try:
     with st.spinner("데이터 동기화 중..."):
         df_port_raw, df_hist_raw, latest_ai_report = load_data()
 
-    # =========== [여기에 디버깅 코드 추가] ===========
-    with st.expander("🛠️ 디버깅: History 시트 데이터 구조 확인"):
-        st.write("현재 대시보드가 인식한 컬럼명:", df_hist_raw.columns.tolist())
-        st.dataframe(df_hist_raw.head())
-    # ===================================================
-
     # --- KPI 및 포트폴리오 연산 ---
     total_asset, normal_asset, pension_asset = 0, 0, 0
     total_diff, total_pct = calc_delta(df_hist_raw)
@@ -134,14 +127,12 @@ try:
 
     df_port = df_port_raw.copy()
     if not df_port.empty:
-        # 데이터 타입 정제
         df_port['Shares'] = clean_numeric(df_port.get('Shares', pd.Series([0]*len(df_port))))
         df_port['Current_Price'] = clean_numeric(df_port.get('Current_Price', pd.Series([0]*len(df_port))))
         df_port['Avg_Price'] = clean_numeric(df_port.get('Avg_Price', pd.Series([0]*len(df_port))))
         df_port['Currency'] = df_port.get('Currency', pd.Series(['KRW']*len(df_port))).astype(str).str.strip().str.upper()
         df_port['Account'] = df_port.get('Account', pd.Series(['일반']*len(df_port))).astype(str).str.strip()
 
-        # 평가액 및 수익률 계산
         def get_krw_val(row, price_col):
             price = row[price_col]
             return price * row['Shares'] * usd_krw if row['Currency'] == 'USD' else price * row['Shares']
@@ -153,6 +144,37 @@ try:
         total_asset = df_port['Total_Value_KRW'].sum()
         normal_asset = df_port[df_port['Account'] == '일반']['Total_Value_KRW'].sum()
         pension_asset = df_port[df_port['Account'] == '연금']['Total_Value_KRW'].sum()
+
+    # --- 매크로 지표 패널 ---
+    st.markdown("### 🌍 글로벌 매크로 지표 (실시간)")
+    macro_cols = st.columns(3)
+    
+    @st.cache_data(ttl=3600)
+    def fetch_macro_indicators():
+        try:
+            vix_data = yf.Ticker("^VIX").history(period="2d")
+            us10y_data = yf.Ticker("^TNX").history(period="2d")
+            
+            vix = vix_data['Close'].iloc[-1] if not vix_data.empty else 0
+            vix_diff = vix - vix_data['Close'].iloc[-2] if len(vix_data) > 1 else 0
+            
+            us10y = us10y_data['Close'].iloc[-1] if not us10y_data.empty else 0
+            us10y_diff = us10y - us10y_data['Close'].iloc[-2] if len(us10y_data) > 1 else 0
+            
+            return vix, vix_diff, us10y, us10y_diff
+        except:
+            return 0, 0, 0, 0
+
+    vix_val, vix_diff, us10y_val, us10y_diff = fetch_macro_indicators()
+
+    with macro_cols[0]:
+        st.metric(label="🇺🇸 미 10년물 국채 금리", value=f"{us10y_val:.2f}%", delta=f"{us10y_diff:+.2f}%p", delta_color="inverse")
+    with macro_cols[1]:
+        st.metric(label="📉 VIX (변동성 지수)", value=f"{vix_val:.2f}", delta=f"{vix_diff:+.2f}", delta_color="inverse")
+    with macro_cols[2]:
+        st.metric(label="💵 원/달러 환율", value=f"{usd_krw:,.2f} 원", delta=None)
+        
+    st.markdown("<br>", unsafe_allow_html=True)
 
     # --- PART 1: 커스텀 HTML 전광판 ---
     def render_card(title, value, diff, pct):
@@ -174,19 +196,13 @@ try:
     # --- PART 2: 시계열 및 비중 차트 ---
     g1, g2 = st.columns([6, 4])
     
-        # --- PART 2: 시계열 및 비중 차트 ---
-    g1, g2 = st.columns([6, 4])
-    
     with g1:
         st.subheader("📈 자산 성장 타임라인")
         if not df_hist_raw.empty and 'Date' in df_hist_raw.columns and 'Total_Value_KRW' in df_hist_raw.columns:
             df_chart = df_hist_raw.copy()
-            
-            # 여기도 dt.date 대신 dt.normalize() 적용
             df_chart['Date'] = pd.to_datetime(df_chart['Date'], errors='coerce').dt.normalize()
             df_chart['Total_Value_KRW'] = clean_numeric(df_chart['Total_Value_KRW'])
             
-            # df_chart.get 오류 방지를 위해 기본값 부여 방식 안전하게 변경
             if 'Account' not in df_chart.columns:
                 df_chart['Account'] = '일반'
             df_chart['Account'] = df_chart['Account'].astype(str).str.strip()
@@ -211,7 +227,7 @@ try:
                 if '금' in name or ticker in ['IAU', 'GLD', '411060', '132030']: return "금 (Gold) ETF"
                 elif row['Currency'] == "USD": return "미국 주식 (USD)"
                 return "한국 주식 (KRW)"
-            
+                
             df_port['Category'] = df_port.apply(categorize, axis=1)
             pie_data = df_port.groupby('Category')['Total_Value_KRW'].sum().reset_index()
             fig = px.pie(pie_data, values='Total_Value_KRW', names='Category', hole=0.4, color_discrete_sequence=['#FF4B4B', '#1C83E1', '#FBC02D'])
