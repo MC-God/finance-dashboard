@@ -122,7 +122,7 @@ def run_portfolio_settlement():
             key = (ticker, account, currency)
             if key not in holdings:
                 holdings[key] = {'shares': 0.0, 'total_cost': 0.0}
-                
+            
             if action in ['매수', 'buy', 'Buy', 'BUY', '지급', '입고']:
                 holdings[key]['shares'] += shares
                 holdings[key]['total_cost'] += (shares * price)
@@ -187,26 +187,42 @@ def run_portfolio_settlement():
         if portfolio_rows:
             port_sheet.append_rows(portfolio_rows)
             
+        # ==============================================================
+        # [수정 2] History 시트 구조 보호 및 갱신 로직 (헤더 누락 완벽 방어)
+        # ==============================================================
         try:
             hist_sheet = doc.worksheet("History")
         except Exception:
             hist_sheet = doc.add_worksheet(title="History", rows="1000", cols="10")
-            hist_sheet.append_row(["Date", "Ticker", "Stock_Name", "Total_Value_KRW", "Account"])
+            
+        hist_header = ["Date", "Ticker", "Stock_Name", "Total_Value_KRW", "Account"]
+        all_hist_values = hist_sheet.get_all_values()
+        
+        # 헤더 방어 로직: 시트가 완전히 비었거나 헤더가 다르면 초기 세팅
+        if not all_hist_values or all_hist_values[0][0] != "Date":
+            hist_sheet.insert_row(hist_header, index=1)
             
         all_hist_records = hist_sheet.get_all_records()
+        
+        # 당일 데이터 중복 갱신을 위해 어제까지의 데이터만 남기기
         if all_hist_records:
             df_hist_temp = pd.DataFrame(all_hist_records)
             if 'Date' in df_hist_temp.columns:
                 df_keep = df_hist_temp[df_hist_temp['Date'].astype(str).str.strip() != today_str]
                 hist_sheet.clear()
-                hist_sheet.append_row(["Date", "Ticker", "Stock_Name", "Total_Value_KRW", "Account"])
+                hist_sheet.append_row(hist_header) # 클리어 후 무조건 헤더부터 다시 삽입
                 if not df_keep.empty:
                     hist_sheet.append_rows(df_keep.values.tolist())
+        else:
+            # 기록이 하나도 없었다면 클리어 후 헤더만 삽입
+            hist_sheet.clear()
+            hist_sheet.append_row(hist_header)
 
+        # 오늘 정산된 새로운 데이터 추가
         if history_rows:
             hist_sheet.append_rows(history_rows)
 
-        print(f"✅ [미국 주식 시세 복원 완료] {today_str} 일자 정산 및 갱신 성공!")
+        print(f"✅ [미국 주식 시세 복원 및 헤더 방어 완료] {today_str} 일자 정산 및 갱신 성공!")
 
     except Exception as e:
         print(f"❌ 정산 엔진 가동 중 시스템 예외 발생: {e}")

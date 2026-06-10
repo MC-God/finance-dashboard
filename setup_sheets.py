@@ -18,12 +18,14 @@ def setup_google_sheets_template():
         print(f"❌ 시트를 열 수 없습니다. .env 파일의 SPREADSHEET_ID를 확인하세요: {e}")
         return
 
-    # 2. 시트별 헤더 스키마 정의 (텐베거 의견 추가)
+    # 2. 시트별 헤더 스키마 정의 (최신 아키텍처 반영)
     templates = {
-        "Portfolio": ["Ticker", "Shares", "Avg_Price", "Current_Price", "1D_Return"],
-        "Transaction": ["Date", "Type", "Ticker", "Shares", "Price"],
+        "Portfolio": ["Ticker", "Stock_Name", "Shares", "Avg_Price", "Current_Price", "1D_Return", "Currency", "Account"],
+        "Transaction": ["Date", "Type", "Ticker", "Shares", "Price", "Account", "Currency"],
+        "History": ["Date", "Ticker", "Stock_Name", "Total_Value_KRW", "Account"],
         "AI_Reports": ["Date", "Quant_Opinion", "Macro_Opinion", "Value_Opinion", "Ten_Bagger_Opinion"]
     }
+
 
     # 3. 각 시트 확인 및 템플릿 적용
     for sheet_name, headers in templates.items():
