@@ -5,7 +5,7 @@ import json
 import requests
 import datetime
 import plotly.express as px
-import pandas_datareader.data as web
+import yfinance as yf
 from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
 
@@ -78,17 +78,14 @@ def load_data():
 # 3. 데이터 정제 및 연산 엔진
 # ==========================================
 def clean_numeric(series):
-    """문자열에 섞인 콤마, 통화 기호 등을 제거하고 숫자로 강제 변환"""
     cleaned = series.astype(str).str.replace(r'[^\d\.-]', '', regex=True)
     return pd.to_numeric(cleaned, errors='coerce').fillna(0)
 
 def calc_delta(df_hist, account_type=None):
-    """History 데이터를 바탕으로 전일 대비 증감액 계산"""
     if df_hist.empty or 'Date' not in df_hist.columns or 'Total_Value_KRW' not in df_hist.columns:
         return 0, 0
         
     df = df_hist.copy()
-    
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
     df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
     df = df.dropna(subset=['Date'])
@@ -146,7 +143,7 @@ try:
         normal_asset = df_port[df_port['Account'] == '일반']['Total_Value_KRW'].sum()
         pension_asset = df_port[df_port['Account'] == '연금']['Total_Value_KRW'].sum()
 
-    # --- 공통 렌더링 함수 (빨강=상승, 파랑=하락 통일) ---
+    # --- 공통 렌더링 함수 (빨강=상승, 파랑=하락 전역 통일) ---
     def render_card(title, value, diff, pct=None, unit="원"):
         if diff > 0:
             color, arrow, sign = "#FF4B4B", "🔺", "+"
@@ -167,34 +164,42 @@ try:
         </div>
         """
 
-    # --- 매크로 지표 패널 (미국채 2, 10, 30년물) ---
+    # --- 매크로 지표 패널 (미국채 5, 10, 30년물 + VIX) ---
     st.markdown("### 🌍 글로벌 매크로 지표 (실시간)")
-    macro_cols = st.columns(3)
+    macro_cols = st.columns(4)
     
     @st.cache_data(ttl=3600)
-    def fetch_treasury_yields():
+    def fetch_macro_indicators():
         try:
-            end = datetime.datetime.now()
-            start = end - datetime.timedelta(days=10)
-            
-            df_2y = web.DataReader('DGS2', 'fred', start, end).dropna()
-            df_10y = web.DataReader('DGS10', 'fred', start, end).dropna()
-            df_30y = web.DataReader('DGS30', 'fred', start, end).dropna()
-            
-            def get_vals(df):
-                if len(df) >= 2: return df.iloc[-1, 0], df.iloc[-1, 0] - df.iloc[-2, 0]
-                elif len(df) == 1: return df.iloc[-1, 0], 0
-                return 0, 0
-                
-            return *get_vals(df_2y), *get_vals(df_10y), *get_vals(df_30y)
+            # yfinance 하나로 모든 데이터 추출 (호환성 에러 원천 차단)
+            tickers = {
+                "5Y": "^FVX",
+                "10Y": "^TNX",
+                "30Y": "^TYX",
+                "VIX": "^VIX"
+            }
+            res = {}
+            for name, t in tickers.items():
+                df = yf.Ticker(t).history(period="2d")
+                if len(df) >= 2:
+                    val = df['Close'].iloc[-1]
+                    diff = val - df['Close'].iloc[-2]
+                elif len(df) == 1:
+                    val = df['Close'].iloc[-1]
+                    diff = 0
+                else:
+                    val, diff = 0, 0
+                res[name] = (val, diff)
+            return res
         except:
-            return 0,0, 0,0, 0,0
+            return {"5Y":(0,0), "10Y":(0,0), "30Y":(0,0), "VIX":(0,0)}
 
-    y2_val, y2_diff, y10_val, y10_diff, y30_val, y30_diff = fetch_treasury_yields()
+    macro_data = fetch_macro_indicators()
 
-    with macro_cols[0]: st.markdown(render_card("🇺🇸 미 2년물 국채 금리", y2_val, y2_diff, unit="%"), unsafe_allow_html=True)
-    with macro_cols[1]: st.markdown(render_card("🇺🇸 미 10년물 국채 금리", y10_val, y10_diff, unit="%"), unsafe_allow_html=True)
-    with macro_cols[2]: st.markdown(render_card("🇺🇸 미 30년물 국채 금리", y30_val, y30_diff, unit="%"), unsafe_allow_html=True)
+    with macro_cols[0]: st.markdown(render_card("🇺🇸 미 5년물 국채", macro_data["5Y"][0], macro_data["5Y"][1], unit="%"), unsafe_allow_html=True)
+    with macro_cols[1]: st.markdown(render_card("🇺🇸 미 10년물 국채", macro_data["10Y"][0], macro_data["10Y"][1], unit="%"), unsafe_allow_html=True)
+    with macro_cols[2]: st.markdown(render_card("🇺🇸 미 30년물 국채", macro_data["30Y"][0], macro_data["30Y"][1], unit="%"), unsafe_allow_html=True)
+    with macro_cols[3]: st.markdown(render_card("📉 VIX (공포지수)", macro_data["VIX"][0], macro_data["VIX"][1], unit="pt"), unsafe_allow_html=True)
         
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -258,7 +263,7 @@ try:
         df_display['현재가'] = df_port.apply(lambda r: f"${r['Current_Price']:,.2f}" if r['Currency'] == 'USD' else f"{int(r['Current_Price']):,}원", axis=1)
         
         df_display['ROI_Val'] = df_port['ROI']
-        # 빨간 위삼각형, 파랑 아래삼각형 전역 통일
+        # 하락 파랑 🔻, 상승 빨강 🔺 전역 통일 적용
         df_display['수익률'] = df_port['ROI'].apply(lambda x: f"🔺 +{x:.2f}%" if x > 0 else f"🔻 {x:.2f}%" if x < 0 else f"▫️ {x:.2f}%")
         df_display['평가가치'] = df_port['Total_Value_KRW'].apply(lambda x: f"{int(x):,} 원")
         df_display['계좌'] = df_port['Account']
