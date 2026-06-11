@@ -12,7 +12,6 @@ from src.ai_agent import analyze_portfolio
 load_dotenv()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
-# 🇺🇸 미국 주식 및 대표 ETF 고정 표준 매핑 소스
 US_STOCK_NAME_REGISTRY = {
     '0013P0': 'RISE 미국은행TOP10', 
     'TSLA': '테슬라', 'AAPL': '애플', 'NVDA': '엔비디아', 'MSFT': '마이크로소프트',
@@ -51,7 +50,6 @@ def run_daily_batch(mode="all"):
     doc = client.open_by_key(SPREADSHEET_ID)
     usd_krw = get_usd_krw_rate()
 
-    # 1. 마스터 레지스트리 동기화 (종목명 맵핑용)
     krx_name_registry = {}
     print("📋 한국거래소(KRX) & ETF 마스터 레지스트리 동기화 중...")
     try:
@@ -64,7 +62,6 @@ def run_daily_batch(mode="all"):
     except Exception as e:
         print(f"⚠️ 레지스트리 로드 실패: {e}")
 
-    # 2. Transaction 기반 보유 주식 정밀 계산
     tx_records = doc.worksheet("Transaction").get_all_records()
     holdings = {}
     for row in tx_records:
@@ -95,7 +92,11 @@ def run_daily_batch(mode="all"):
                 holdings[key]['shares'] -= shares
 
     port_sheet = doc.worksheet("Portfolio")
-    old_prices = {str(r.get("Ticker")).strip(): (r.get("Current_Price", 0), r.get("1D_Return", "0.00%")) for r in port_sheet.get_all_records()}
+    old_prices = {}
+    for r in port_sheet.get_all_records():
+        t = str(r.get("Ticker", "")).strip()
+        if t.isdigit(): t = t.zfill(6)
+        old_prices[t] = (r.get("Current_Price", 0), r.get("1D_Return", "0.00%"), str(r.get("Stock_Name", t)))
 
     portfolio_rows = []
     history_rows = []
@@ -107,17 +108,17 @@ def run_daily_batch(mode="all"):
         if shares <= 0: continue
 
         avg_price = data['total_cost'] / shares
-        is_kr = ticker.isdigit()
         
-        # 이름 매핑 적용
-        if is_kr: stock_name = krx_name_registry.get(ticker, f"국내증권({ticker})")
-        else: stock_name = US_STOCK_NAME_REGISTRY.get(ticker.upper(), ticker.upper())
-
+        # [수정 1] 이빨 빠진 판별식 수리: 영문 섞인 ETF나 KRW 통화도 한국주식으로 인식
+        is_kr = ticker.isdigit() or ticker in krx_name_registry or currency == 'KRW'
+        
         current_price = avg_price
         one_day_return = "0.00%"
-
+        
         if ticker in old_prices:
-            current_price, one_day_return = old_prices[ticker]
+            current_price, one_day_return, stock_name = old_prices[ticker]
+        else:
+            stock_name = krx_name_registry.get(ticker, ticker) if is_kr else US_STOCK_NAME_REGISTRY.get(ticker.upper(), ticker.upper())
 
         should_fetch = True
         if mode == "kr" and not is_kr: should_fetch = False
@@ -126,8 +127,19 @@ def run_daily_batch(mode="all"):
         if should_fetch:
             print(f"[{ticker}] 최신 시세 동기화 중...")
             try:
-                if is_kr: df_stock = fdr.DataReader(ticker, start=(kst_now - datetime.timedelta(days=7)).strftime('%Y-%m-%d'))
-                else: df_stock = yf.Ticker(ticker).history(period="7d")
+                df_stock = pd.DataFrame()
+                if is_kr:
+                    # [수정 2] 3단 하이브리드 수집 엔진 (KS -> KQ -> FDR)
+                    try:
+                        df_stock = yf.Ticker(f"{ticker}.KS").history(period="7d")
+                        if df_stock.empty: 
+                            df_stock = yf.Ticker(f"{ticker}.KQ").history(period="7d")
+                    except: pass
+                    
+                    if df_stock.empty:
+                        df_stock = fdr.DataReader(ticker, start=(kst_now - datetime.timedelta(days=7)).strftime('%Y-%m-%d'))
+                else: 
+                    df_stock = yf.Ticker(ticker).history(period="7d")
                     
                 if df_stock is not None and not df_stock.empty:
                     df_stock = df_stock.dropna(subset=['Close'])
@@ -141,9 +153,10 @@ def run_daily_batch(mode="all"):
                 print(f"⚠️ [{ticker}] 시세 연동 실패: {e}")
 
         total_value_krw = shares * current_price * usd_krw if currency == 'USD' else shares * current_price
-
-        portfolio_rows.append([ticker, stock_name, shares, round(avg_price, 2), current_price, one_day_return, currency, account])
-        history_rows.append([snapshot_date_str, ticker, stock_name, total_value_krw, account])
+        safe_ticker = f"'{ticker}" if is_kr else ticker
+        
+        portfolio_rows.append([safe_ticker, stock_name, shares, round(avg_price, 2), current_price, one_day_return, currency, account])
+        history_rows.append([snapshot_date_str, safe_ticker, stock_name, total_value_krw, account])
         portfolio_text_list.append(f"Ticker: {ticker} | Name: {stock_name} | Shares: {shares} | Avg_Price: {avg_price:.2f} | Current_Price: {current_price:.2f} | 1D_Return: {one_day_return}")
 
     port_sheet.clear()
@@ -151,7 +164,6 @@ def run_daily_batch(mode="all"):
     port_sheet.append_row(port_headers)
     if portfolio_rows: port_sheet.append_rows(portfolio_rows)
 
-    # 6. History 스냅샷 저장 (강력한 컬럼 정렬 보호 탑재)
     try: hist_sheet = doc.worksheet("History")
     except: hist_sheet = doc.add_worksheet(title="History", rows="1000", cols="10")
         
@@ -162,7 +174,6 @@ def run_daily_batch(mode="all"):
     all_hist_records = hist_sheet.get_all_records()
     if all_hist_records:
         df_hist_temp = pd.DataFrame(all_hist_records)
-        # 컬럼 순서가 꼬이는 것을 막기 위해 강제 정렬
         for col in hist_header:
             if col not in df_hist_temp.columns: df_hist_temp[col] = ""
         df_hist_temp = df_hist_temp[hist_header]
@@ -179,7 +190,6 @@ def run_daily_batch(mode="all"):
     if history_rows: hist_sheet.append_rows(history_rows)
     print("✅ 포트폴리오 및 히스토리 스냅샷 (오전/오후) 저장 완료!")
 
-    # 7. AI 분석 로직
     if mode in ["us", "all"]:
         portfolio_data_str = "\n".join(portfolio_text_list)
         if portfolio_data_str.strip():

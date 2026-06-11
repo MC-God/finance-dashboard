@@ -47,8 +47,6 @@ def get_usd_krw_rate():
 def load_data():
     client = get_sheet_client()
     doc = client.open_by_key(SPREADSHEET_ID)
-    
-    # 에러를 무시하지 않고 화면에 직접 띄워주는 강력한 fetcher
     def fetch_sheet(name):
         try:
             worksheet = doc.worksheet(name)
@@ -70,15 +68,17 @@ def clean_numeric(series):
 def calc_delta(df_hist, account_type=None):
     if df_hist.empty or 'Date' not in df_hist.columns or 'Total_Value_KRW' not in df_hist.columns: return 0, 0
     df = df_hist.copy()
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce') 
+    
+    df['ExactDate'] = pd.to_datetime(df['Date'], errors='coerce') 
     df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
-    df = df.dropna(subset=['Date'])
+    df = df.dropna(subset=['ExactDate'])
+    
     if account_type and 'Account' in df.columns: df = df[df['Account'].str.strip() == account_type]
     
-    daily_sum = df.groupby('Date')['Total_Value_KRW'].sum().sort_index()
-    if len(daily_sum) < 2: return 0, 0
-    diff = daily_sum.iloc[-1] - daily_sum.iloc[-2]
-    pct = (diff / daily_sum.iloc[-2] * 100) if daily_sum.iloc[-2] != 0 else 0
+    snapshot_sums = df.groupby('ExactDate')['Total_Value_KRW'].sum().sort_index()
+    if len(snapshot_sums) < 2: return 0, 0
+    diff = snapshot_sums.iloc[-1] - snapshot_sums.iloc[-2]
+    pct = (diff / snapshot_sums.iloc[-2] * 100) if snapshot_sums.iloc[-2] != 0 else 0
     return diff, pct
 
 @st.cache_data(ttl=604800)
@@ -127,6 +127,7 @@ try:
 
     df_port = df_port_raw.copy()
     if not df_port.empty:
+        df_port['Ticker'] = df_port['Ticker'].astype(str).str.replace("'", "") 
         df_port['Shares'] = clean_numeric(df_port.get('Shares', pd.Series([0]*len(df_port))))
         df_port['Current_Price'] = clean_numeric(df_port.get('Current_Price', pd.Series([0]*len(df_port))))
         df_port['Avg_Price'] = clean_numeric(df_port.get('Avg_Price', pd.Series([0]*len(df_port))))
@@ -187,14 +188,28 @@ try:
         st.subheader("📈 자산 성장 타임라인")
         if not df_hist_raw.empty and 'Date' in df_hist_raw.columns:
             df_chart = df_hist_raw.copy()
-            df_chart['Date'] = pd.to_datetime(df_chart['Date'], errors='coerce')
+            df_chart['ExactDate'] = pd.to_datetime(df_chart['Date'], errors='coerce')
             df_chart['Total_Value_KRW'] = clean_numeric(df_chart['Total_Value_KRW'])
             df_chart['Account'] = df_chart.get('Account', '일반').astype(str).str.strip()
-            df_chart = df_chart.dropna(subset=['Date'])
+            df_chart = df_chart.dropna(subset=['ExactDate'])
+            
             if not df_chart.empty:
-                df_timeline = df_chart.groupby(['Date', 'Account'])['Total_Value_KRW'].sum().unstack(fill_value=0)
-                df_timeline['총 자산'] = df_timeline.sum(axis=1)
-                st.line_chart(df_timeline)
+                # [수정 2] Plotly를 이용한 정확한 점(Marker) 및 시간축 렌더링
+                df_timeline = df_chart.groupby(['ExactDate', 'Account'])['Total_Value_KRW'].sum().reset_index()
+                df_total = df_timeline.groupby('ExactDate')['Total_Value_KRW'].sum().reset_index()
+                df_total['Account'] = '총 자산'
+                df_timeline = pd.concat([df_timeline, df_total], ignore_index=True)
+                
+                fig_line = px.line(
+                    df_timeline, x='ExactDate', y='Total_Value_KRW', color='Account',
+                    markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
+                )
+                fig_line.update_layout(
+                    margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+                    xaxis_title=None, yaxis_title=None, legend_title=None,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                st.plotly_chart(fig_line, use_container_width=True)
             else: st.info("차트를 그릴 수 있는 유효한 날짜 데이터가 없습니다.")
         else: st.info("📅 아직 데이터 축적량이 부족합니다.")
 
@@ -223,24 +238,28 @@ try:
         try:
             end = datetime.datetime.now()
             start = end - datetime.timedelta(days=365)
-            df_spy = yf.Ticker('^GSPC').history(start=start, end=end)
-            spy_close = df_spy['Close']
             
-            df_kospi = fdr.DataReader('KS11', start, end)
-            kospi_close = df_kospi['Close']
+            # [수정 3] NaN 데이터 완벽 폐기를 위한 dropna() 강제 주입
+            df_spy = yf.Ticker('^GSPC').history(start=start, end=end)
+            spy_close = df_spy['Close'].dropna() 
+            
+            df_kospi = yf.Ticker('^KS11').history(start=start, end=end)
+            kospi_close = df_kospi['Close'].dropna() 
             
             def get_risk_metrics(series):
-                if series.empty: return 0, 0, 0
-                ret = (series.iloc[-1] / series.iloc[0] - 1) * 100
+                if series.empty: return 0.0, 0.0, 0.0
+                v_start = float(series.values[0])
+                v_end = float(series.values[-1])
+                ret = (v_end / v_start - 1) * 100 if v_start != 0 else 0
                 roll_max = series.cummax()
                 drawdown = (series / roll_max - 1) * 100
-                return ret, drawdown.min(), drawdown.iloc[-1]
+                return float(ret), float(drawdown.min()), float(drawdown.values[-1])
                 
             spy_ret, spy_mdd, spy_cdd = get_risk_metrics(spy_close)
             kospi_ret, kospi_mdd, kospi_cdd = get_risk_metrics(kospi_close)
             return spy_ret, spy_mdd, spy_cdd, kospi_ret, kospi_mdd, kospi_cdd
         except Exception as e:
-            return 0,0,0, 0,0,0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     sr, sm, sc, kr, km, kc = fetch_benchmarks()
     bm_cols = st.columns(2)
