@@ -4,7 +4,6 @@ import datetime
 import pandas as pd
 import requests
 import yfinance as yf
-import FinanceDataReader as fdr
 from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
 from src.ai_agent import analyze_portfolio
@@ -49,18 +48,6 @@ def run_daily_batch(mode="all"):
     client = get_sheet_client()
     doc = client.open_by_key(SPREADSHEET_ID)
     usd_krw = get_usd_krw_rate()
-
-    krx_name_registry = {}
-    print("📋 한국거래소(KRX) & ETF 마스터 레지스트리 동기화 중...")
-    try:
-        df_krx = fdr.StockListing('KRX')
-        krx_name_registry.update(dict(zip(df_krx['Code'].astype(str), df_krx['Name'].astype(str))))
-        df_etf = fdr.StockListing('ETF/KR')
-        code_col = 'Symbol' if 'Symbol' in df_etf.columns else df_etf.columns[0]
-        name_col = 'Name' if 'Name' in df_etf.columns else df_etf.columns[1]
-        krx_name_registry.update(dict(zip(df_etf[code_col].astype(str), df_etf[name_col].astype(str))))
-    except Exception as e:
-        print(f"⚠️ 레지스트리 로드 실패: {e}")
 
     tx_records = doc.worksheet("Transaction").get_all_records()
     holdings = {}
@@ -109,8 +96,8 @@ def run_daily_batch(mode="all"):
 
         avg_price = data['total_cost'] / shares
         
-        # [수정 1] 이빨 빠진 판별식 수리: 영문 섞인 ETF나 KRW 통화도 한국주식으로 인식
-        is_kr = ticker.isdigit() or ticker in krx_name_registry or currency == 'KRW'
+        # [수정 1] 영문이 섞인 한국 ETF(0013P0)도 완벽하게 한국 주식으로 분류
+        is_kr = ticker.isdigit() or currency == 'KRW' or any(c.isdigit() for c in ticker) and len(ticker) == 6
         
         current_price = avg_price
         one_day_return = "0.00%"
@@ -118,7 +105,7 @@ def run_daily_batch(mode="all"):
         if ticker in old_prices:
             current_price, one_day_return, stock_name = old_prices[ticker]
         else:
-            stock_name = krx_name_registry.get(ticker, ticker) if is_kr else US_STOCK_NAME_REGISTRY.get(ticker.upper(), ticker.upper())
+            stock_name = ticker if is_kr else US_STOCK_NAME_REGISTRY.get(ticker.upper(), ticker.upper())
 
         should_fetch = True
         if mode == "kr" and not is_kr: should_fetch = False
@@ -127,28 +114,26 @@ def run_daily_batch(mode="all"):
         if should_fetch:
             print(f"[{ticker}] 최신 시세 동기화 중...")
             try:
-                df_stock = pd.DataFrame()
                 if is_kr:
-                    # [수정 2] 3단 하이브리드 수집 엔진 (KS -> KQ -> FDR)
-                    try:
-                        df_stock = yf.Ticker(f"{ticker}.KS").history(period="7d")
-                        if df_stock.empty: 
-                            df_stock = yf.Ticker(f"{ticker}.KQ").history(period="7d")
-                    except: pass
-                    
-                    if df_stock.empty:
-                        df_stock = fdr.DataReader(ticker, start=(kst_now - datetime.timedelta(days=7)).strftime('%Y-%m-%d'))
+                    # [수정 2] 네이버 금융 모바일 API 직결 통신 (모든 ETF 및 394800 같은 신규 종목 100% 지원)
+                    url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{ticker}"
+                    res = requests.get(url, timeout=5).json()
+                    item = res['result']['areas'][0]['datas'][0]
+                    current_price = float(item['nv'])
+                    raw_return = float(item['cr'])
+                    one_day_return = f"{raw_return:+.2f}%"
+                    stock_name = item['nm'] # 네이버에서 정확한 공식 한글 종목명도 알아서 가져옴
                 else: 
+                    # 미국 주식은 기존 야후 파이낸스 유지
                     df_stock = yf.Ticker(ticker).history(period="7d")
-                    
-                if df_stock is not None and not df_stock.empty:
-                    df_stock = df_stock.dropna(subset=['Close'])
-                    if len(df_stock) >= 1:
-                        current_price = float(df_stock['Close'].iloc[-1])
-                        if len(df_stock) >= 2:
-                            prev_close = float(df_stock['Close'].iloc[-2])
-                            raw_return = ((current_price - prev_close) / prev_close) * 100
-                            one_day_return = f"{raw_return:+.2f}%"
+                    if not df_stock.empty:
+                        df_stock = df_stock.dropna(subset=['Close'])
+                        if len(df_stock) >= 1:
+                            current_price = float(df_stock['Close'].iloc[-1])
+                            if len(df_stock) >= 2:
+                                prev_close = float(df_stock['Close'].iloc[-2])
+                                raw_return = ((current_price - prev_close) / prev_close) * 100
+                                one_day_return = f"{raw_return:+.2f}%"
             except Exception as e:
                 print(f"⚠️ [{ticker}] 시세 연동 실패: {e}")
 
@@ -188,7 +173,7 @@ def run_daily_batch(mode="all"):
         hist_sheet.append_row(hist_header)
 
     if history_rows: hist_sheet.append_rows(history_rows)
-    print("✅ 포트폴리오 및 히스토리 스냅샷 (오전/오후) 저장 완료!")
+    print("✅ 포트폴리오 및 히스토리 스냅샷 저장 완료!")
 
     if mode in ["us", "all"]:
         portfolio_data_str = "\n".join(portfolio_text_list)

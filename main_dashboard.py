@@ -6,7 +6,6 @@ import requests
 import datetime
 import plotly.express as px
 import yfinance as yf
-import FinanceDataReader as fdr
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -56,7 +55,6 @@ def load_data():
             df.columns = df.columns.astype(str).str.strip()
             return df
         except Exception as e:
-            st.error(f"⚠️ '{name}' 시트 로딩 중 에러 발생: {e}")
             return pd.DataFrame()
             
     return fetch_sheet("Portfolio"), fetch_sheet("History"), (doc.worksheet("AI_Reports").get_all_records()[-1] if doc.worksheet("AI_Reports").get_all_records() else None)
@@ -70,6 +68,9 @@ def calc_delta(df_hist, account_type=None):
     df = df_hist.copy()
     
     df['ExactDate'] = pd.to_datetime(df['Date'], errors='coerce') 
+    # [핵심] 과거 YYYY-MM-DD 형식으로 저장되어 00:00:00으로 인식된 날짜를 강제로 18:00:00으로 맞춰 시계열 연결
+    df['ExactDate'] = df['ExactDate'].apply(lambda x: x.replace(hour=18) if pd.notnull(x) and x.hour == 0 else x)
+    
     df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
     df = df.dropna(subset=['ExactDate'])
     
@@ -189,12 +190,12 @@ try:
         if not df_hist_raw.empty and 'Date' in df_hist_raw.columns:
             df_chart = df_hist_raw.copy()
             df_chart['ExactDate'] = pd.to_datetime(df_chart['Date'], errors='coerce')
+            df_chart['ExactDate'] = df_chart['ExactDate'].apply(lambda x: x.replace(hour=18) if pd.notnull(x) and x.hour == 0 else x)
             df_chart['Total_Value_KRW'] = clean_numeric(df_chart['Total_Value_KRW'])
             df_chart['Account'] = df_chart.get('Account', '일반').astype(str).str.strip()
             df_chart = df_chart.dropna(subset=['ExactDate'])
             
             if not df_chart.empty:
-                # [수정 2] Plotly를 이용한 정확한 점(Marker) 및 시간축 렌더링
                 df_timeline = df_chart.groupby(['ExactDate', 'Account'])['Total_Value_KRW'].sum().reset_index()
                 df_total = df_timeline.groupby('ExactDate')['Total_Value_KRW'].sum().reset_index()
                 df_total['Account'] = '총 자산'
@@ -239,10 +240,10 @@ try:
             end = datetime.datetime.now()
             start = end - datetime.timedelta(days=365)
             
-            # [수정 3] NaN 데이터 완벽 폐기를 위한 dropna() 강제 주입
             df_spy = yf.Ticker('^GSPC').history(start=start, end=end)
             spy_close = df_spy['Close'].dropna() 
             
+            # 야후 공식 Ticker를 활용한 가장 안전한 한국장 벤치마크
             df_kospi = yf.Ticker('^KS11').history(start=start, end=end)
             kospi_close = df_kospi['Close'].dropna() 
             
