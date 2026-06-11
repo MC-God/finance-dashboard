@@ -6,6 +6,7 @@ import requests
 import datetime
 import plotly.express as px
 import yfinance as yf
+import FinanceDataReader as fdr
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -55,6 +56,7 @@ def load_data():
             df.columns = df.columns.astype(str).str.strip()
             return df
         except Exception as e:
+            st.error(f"⚠️ '{name}' 시트 로딩 중 에러 발생: {e}")
             return pd.DataFrame()
             
     return fetch_sheet("Portfolio"), fetch_sheet("History"), (doc.worksheet("AI_Reports").get_all_records()[-1] if doc.worksheet("AI_Reports").get_all_records() else None)
@@ -63,14 +65,17 @@ def clean_numeric(series):
     cleaned = series.astype(str).str.replace(r'[^\d\.-]', '', regex=True)
     return pd.to_numeric(cleaned, errors='coerce').fillna(0)
 
+# [핵심] 과거 9일, 10일의 날짜 형식을 11일과 동일하게 18시 정각으로 자동 변환하는 파서
+def parse_exact_date(date_series):
+    s = date_series.astype(str).str.strip()
+    s = s.apply(lambda x: x + " 18:00:00" if len(x) == 10 else x)
+    return pd.to_datetime(s, errors='coerce')
+
 def calc_delta(df_hist, account_type=None):
     if df_hist.empty or 'Date' not in df_hist.columns or 'Total_Value_KRW' not in df_hist.columns: return 0, 0
     df = df_hist.copy()
     
-    df['ExactDate'] = pd.to_datetime(df['Date'], errors='coerce') 
-    # [핵심] 과거 YYYY-MM-DD 형식으로 저장되어 00:00:00으로 인식된 날짜를 강제로 18:00:00으로 맞춰 시계열 연결
-    df['ExactDate'] = df['ExactDate'].apply(lambda x: x.replace(hour=18) if pd.notnull(x) and x.hour == 0 else x)
-    
+    df['ExactDate'] = parse_exact_date(df['Date'])
     df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
     df = df.dropna(subset=['ExactDate'])
     
@@ -158,15 +163,23 @@ try:
 
     st.markdown("### 🌍 글로벌 매크로 지표 (실시간)")
     macro_cols = st.columns(4)
+    
+    # [핵심] 5일 치 데이터를 호출하고 NaN을 버려서 휴장일 0.00%p 고정 버그 완벽 해결
     @st.cache_data(ttl=3600)
     def fetch_macro_indicators():
         try:
             tickers = {"5Y": "^FVX", "10Y": "^TNX", "30Y": "^TYX", "VIX": "^VIX"}
             res = {}
             for name, t in tickers.items():
-                df = yf.Ticker(t).history(period="2d")
-                val = df['Close'].iloc[-1] if len(df) >= 1 else 0
-                diff = val - df['Close'].iloc[-2] if len(df) >= 2 else 0
+                df = yf.Ticker(t).history(period="5d").dropna(subset=['Close'])
+                if len(df) >= 2:
+                    val = float(df['Close'].iloc[-1])
+                    diff = val - float(df['Close'].iloc[-2])
+                elif len(df) == 1:
+                    val = float(df['Close'].iloc[-1])
+                    diff = 0.0
+                else:
+                    val, diff = 0.0, 0.0
                 res[name] = (val, diff)
             return res
         except: return {"5Y":(0,0), "10Y":(0,0), "30Y":(0,0), "VIX":(0,0)}
@@ -189,8 +202,7 @@ try:
         st.subheader("📈 자산 성장 타임라인")
         if not df_hist_raw.empty and 'Date' in df_hist_raw.columns:
             df_chart = df_hist_raw.copy()
-            df_chart['ExactDate'] = pd.to_datetime(df_chart['Date'], errors='coerce')
-            df_chart['ExactDate'] = df_chart['ExactDate'].apply(lambda x: x.replace(hour=18) if pd.notnull(x) and x.hour == 0 else x)
+            df_chart['ExactDate'] = parse_exact_date(df_chart['Date'])
             df_chart['Total_Value_KRW'] = clean_numeric(df_chart['Total_Value_KRW'])
             df_chart['Account'] = df_chart.get('Account', '일반').astype(str).str.strip()
             df_chart = df_chart.dropna(subset=['ExactDate'])
@@ -201,6 +213,7 @@ try:
                 df_total['Account'] = '총 자산'
                 df_timeline = pd.concat([df_timeline, df_total], ignore_index=True)
                 
+                # Plotly를 이용한 완벽한 시계열 연결
                 fig_line = px.line(
                     df_timeline, x='ExactDate', y='Total_Value_KRW', color='Account',
                     markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
@@ -243,7 +256,6 @@ try:
             df_spy = yf.Ticker('^GSPC').history(start=start, end=end)
             spy_close = df_spy['Close'].dropna() 
             
-            # 야후 공식 Ticker를 활용한 가장 안전한 한국장 벤치마크
             df_kospi = yf.Ticker('^KS11').history(start=start, end=end)
             kospi_close = df_kospi['Close'].dropna() 
             
