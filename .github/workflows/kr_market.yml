@@ -2,7 +2,8 @@ name: KR Market Update
 
 on:
   schedule:
-    - cron: '0 7 * * 1-5'
+    # UTC 09:00 = KST 18:00 (오후 6시 한국장 마감 반영)
+    - cron: '0 9 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -12,10 +13,10 @@ jobs:
       - name: 저장소 코드 가져오기
         uses: actions/checkout@v4
 
-      - name: Python 환경 설정 (캐시 적용으로 속도 향상)
+      - name: Python 환경 설정
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: 패키지 설치
@@ -26,7 +27,7 @@ jobs:
       - name: 구글 인증키 생성
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
 
-      - name: 한국장 데이터 업데이트
+      - name: 한국장 데이터 업데이트 및 오후 스냅샷
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

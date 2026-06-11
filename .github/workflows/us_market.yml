@@ -2,7 +2,8 @@ name: US Market & AI Analysis
 
 on:
   schedule:
-    - cron: '30 21 * * 1-5'
+    # UTC 21:00 = KST 06:00 (다음날 아침 6시 미국장 마감 반영)
+    - cron: '0 21 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -15,7 +16,7 @@ jobs:
       - name: Python 환경 설정
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: 패키지 설치
@@ -26,7 +27,7 @@ jobs:
       - name: 구글 인증키 생성
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
 
-      - name: 미국장 업데이트 및 AI 분석
+      - name: 미국장 업데이트, 오전 스냅샷 및 AI 분석
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

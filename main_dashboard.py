@@ -12,9 +12,6 @@ from google.genai import types
 from dotenv import load_dotenv
 from src.sheets_client import get_sheet_client
 
-# ==========================================
-# 1. 초기 설정 및 UI 스타일링
-# ==========================================
 st.set_page_config(page_title="Hedge Fund Style Cockpit", page_icon="🏦", layout="wide")
 
 st.markdown("""
@@ -37,7 +34,6 @@ if "google_credentials" in st.secrets:
 load_dotenv()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or st.secrets.get("SPREADSHEET_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
-
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 def get_usd_krw_rate():
@@ -60,7 +56,6 @@ def load_data():
             df.columns = df.columns.astype(str).str.strip()
             return df
         except: return pd.DataFrame()
-
     return fetch_sheet("Portfolio"), fetch_sheet("History"), (doc.worksheet("AI_Reports").get_all_records()[-1] if doc.worksheet("AI_Reports").get_all_records() else None)
 
 def clean_numeric(series):
@@ -70,74 +65,46 @@ def clean_numeric(series):
 def calc_delta(df_hist, account_type=None):
     if df_hist.empty or 'Date' not in df_hist.columns or 'Total_Value_KRW' not in df_hist.columns: return 0, 0
     df = df_hist.copy()
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
+    # [수정 1] 타임라인이 오전/오후 두 점을 인식하도록 dt.normalize() 제거
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce') 
     df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
     df = df.dropna(subset=['Date'])
     if account_type and 'Account' in df.columns: df = df[df['Account'].str.strip() == account_type]
+    
     daily_sum = df.groupby('Date')['Total_Value_KRW'].sum().sort_index()
     if len(daily_sum) < 2: return 0, 0
     diff = daily_sum.iloc[-1] - daily_sum.iloc[-2]
     pct = (diff / daily_sum.iloc[-2] * 100) if daily_sum.iloc[-2] != 0 else 0
     return diff, pct
 
-# ==========================================
-# 4. 하이브리드 섹터 분류 (API + ML Model)
-# ==========================================
-@st.cache_data(ttl=604800) # 한 번 분류한 데이터는 1주일(604800초)간 캐싱하여 속도 극대화
+@st.cache_data(ttl=604800)
 def get_smart_sectors(portfolio_dicts):
     sector_map = {}
     unclassified = []
-    
-    # 1. 미국 주식 대상 yfinance GICS API 직접 추출
     for row in portfolio_dicts:
-        t = row['Ticker']
-        n = row['Stock_Name']
-        c = row['Currency']
-        
+        t, n, c = row['Ticker'], row['Stock_Name'], row['Currency']
         if c == 'USD' and str(t).isalpha():
             try:
                 info = yf.Ticker(t).info
-                sec = info.get('sector', '')
-                ind = info.get('industry', '')
-                
-                # 반도체와 바이오는 하위 산업군(industry)까지 검사하여 명확히 분리
-                if 'Semiconductor' in ind:
-                    sector_map[t] = '반도체 (Semiconductors)'
-                elif 'Biotech' in ind or 'Health' in sec:
-                    sector_map[t] = '바이오/헬스케어 (Healthcare)'
+                sec, ind = info.get('sector', ''), info.get('industry', '')
+                if 'Semiconductor' in ind: sector_map[t] = '반도체 (Semiconductors)'
+                elif 'Biotech' in ind or 'Health' in sec: sector_map[t] = '바이오/헬스케어 (Healthcare)'
                 elif sec:
                     sector_map[t] = sec
                     continue
-            except:
-                pass
-        
-        # API 조회가 안되는 ETF나 한국 주식은 미분류로 적재
+            except: pass
         if t not in sector_map:
             unclassified.append({"ticker": t, "name": n, "currency": c})
             
-    # 2. 미분류 종목 대상 Gemini Zero-shot 머신러닝 분류
     if unclassified and ai_client:
-        prompt = """
-        다음의 주식/ETF 종목 리스트를 분석하여, 각 종목을 아래 카테고리 중 가장 적합한 하나로만 맵핑해줘.
+        prompt = """다음 리스트를 분석하여, 각 종목을 가장 적합한 하나로 맵핑해줘.
         [반도체, 바이오/헬스케어, 빅테크/IT, 배당/인컴, 시장지수, 금융, 소비재, 자동차/모빌리티, 안전자산, 채권, 산업재, 기타]
-        
-        오직 아래의 JSON 형식으로만 반환할 것. 다른 설명은 절대 추가하지 마.
-        {"AAPL": "빅테크/IT", "005930": "반도체", "TIGER 200": "시장지수"}
-        
-        종목 리스트:
-        """ + str(unclassified)
-        
+        오직 아래의 JSON 형식으로만 반환할 것. {"AAPL": "빅테크/IT", "005930": "반도체"}
+        종목 리스트: """ + str(unclassified)
         try:
-            res = ai_client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
-            ml_result = json.loads(res.text)
-            sector_map.update(ml_result)
-        except Exception as e:
-            print("ML Classification Error:", e)
-            
+            res = ai_client.models.generate_content(model='gemini-3.5-flash', contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json"))
+            sector_map.update(json.loads(res.text))
+        except: pass
     return sector_map
 
 st.title("🏦 포트폴리오 자산 운용 콕핏")
@@ -169,9 +136,7 @@ try:
         df_port['Total_Cost_KRW'] = df_port.apply(lambda r: get_krw_val(r, 'Avg_Price'), axis=1)
         df_port['ROI'] = df_port.apply(lambda r: ((r['Total_Value_KRW'] - r['Total_Cost_KRW']) / r['Total_Cost_KRW'] * 100) if r['Total_Cost_KRW'] > 0 else 0, axis=1)
         
-        # 하이브리드 섹터 매핑 적용
-        minimal_data = df_port[['Ticker', 'Stock_Name', 'Currency']].to_dict('records')
-        sector_mapping = get_smart_sectors(minimal_data)
+        sector_mapping = get_smart_sectors(df_port[['Ticker', 'Stock_Name', 'Currency']].to_dict('records'))
         df_port['Sector'] = df_port['Ticker'].apply(lambda x: sector_mapping.get(str(x), '기타 산업군'))
 
         total_asset = df_port['Total_Value_KRW'].sum()
@@ -185,7 +150,6 @@ try:
         pct_str = f" ({sign}{pct:.2f}%)" if pct is not None else ""
         return f"""<div class="metric-card"><p class="metric-title">{title}</p><h2 class="metric-value">{value_fmt} <span class="metric-unit">{unit}</span></h2><p style="color: {color}; margin-top: 8px; font-size: 15px; margin-bottom: 0; font-weight: 500;">{arrow} {sign}{diff_fmt}{pct_str}</p></div>"""
 
-    # --- 매크로 지표 패널 ---
     st.markdown("### 🌍 글로벌 매크로 지표 (실시간)")
     macro_cols = st.columns(4)
     @st.cache_data(ttl=3600)
@@ -208,20 +172,18 @@ try:
     with macro_cols[3]: st.markdown(render_card("📉 VIX (공포지수)", macro_data["VIX"][0], macro_data["VIX"][1], unit="pt"), unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # --- 자산 전광판 ---
     col1, col2, col3 = st.columns(3)
     with col1: st.markdown(render_card("💰 총 자산 합계", total_asset, total_diff, total_pct, "원"), unsafe_allow_html=True)
     with col2: st.markdown(render_card("💵 일반 주식계좌 자산", normal_asset, normal_diff, normal_pct, "원"), unsafe_allow_html=True)
     with col3: st.markdown(render_card("🛡️ 연금저축/IRP 자산", pension_asset, pension_diff, pension_pct, "원"), unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # --- 시계열 & 섹터 트리맵 ---
     g1, g2 = st.columns([5, 5])
     with g1:
         st.subheader("📈 자산 성장 타임라인")
         if not df_hist_raw.empty and 'Date' in df_hist_raw.columns:
             df_chart = df_hist_raw.copy()
-            df_chart['Date'] = pd.to_datetime(df_chart['Date'], errors='coerce').dt.normalize()
+            df_chart['Date'] = pd.to_datetime(df_chart['Date'], errors='coerce')
             df_chart['Total_Value_KRW'] = clean_numeric(df_chart['Total_Value_KRW'])
             df_chart['Account'] = df_chart.get('Account', '일반').astype(str).str.strip()
             df_chart = df_chart.dropna(subset=['Date'])
@@ -235,10 +197,11 @@ try:
     with g2:
         st.subheader("🍕 ML 기반 섹터별 심층 비중 (Treemap)")
         if not df_port.empty:
-            # 수익률(ROI) 기준 컬러 매핑 (파랑=하락, 빨강=상승)
+            # [수정 2] 트리맵 렌더링 버그 원천 차단 (가상 뿌리 제거, 실제 열 삽입)
+            df_port['Root'] = '전체 포트폴리오'
             fig = px.treemap(
                 df_port, 
-                path=[px.Constant("전체 포트폴리오"), 'Sector', 'Stock_Name'], 
+                path=['Root', 'Sector', 'Stock_Name'], 
                 values='Total_Value_KRW',
                 color='ROI',
                 color_continuous_scale=['#1C83E1', '#2e3440', '#FF4B4B'],
@@ -249,7 +212,6 @@ try:
 
     st.markdown("---")
 
-    # --- 벤치마크 & 리스크 모니터링 ---
     st.subheader("🛡️ 리스크 관리 & 벤치마크 (1Y)")
     st.caption("내 포트폴리오의 과거 데이터가 30일 이상 축적되면 포트폴리오 자체의 MDD와 Beta 연산도 이곳에 활성화됩니다.")
     
@@ -258,11 +220,10 @@ try:
         try:
             end = datetime.datetime.now()
             start = end - datetime.timedelta(days=365)
-            # S&P 500
-            df_spy = yf.download('^GSPC', start=start, end=end, progress=False)
-            spy_close = df_spy['Close'] if isinstance(df_spy.columns, pd.Index) else df_spy.iloc[:, 0]
+            # [수정 3] yfinance 구조 변경으로 인한 Series 에러 해결 (단일 Ticker 모드 적용)
+            df_spy = yf.Ticker('^GSPC').history(start=start, end=end)
+            spy_close = df_spy['Close']
             
-            # KOSPI
             df_kospi = fdr.DataReader('KS11', start, end)
             kospi_close = df_kospi['Close']
             
@@ -276,7 +237,8 @@ try:
             spy_ret, spy_mdd, spy_cdd = get_risk_metrics(spy_close)
             kospi_ret, kospi_mdd, kospi_cdd = get_risk_metrics(kospi_close)
             return spy_ret, spy_mdd, spy_cdd, kospi_ret, kospi_mdd, kospi_cdd
-        except: return 0,0,0, 0,0,0
+        except Exception as e:
+            return 0,0,0, 0,0,0
 
     sr, sm, sc, kr, km, kc = fetch_benchmarks()
     bm_cols = st.columns(2)
@@ -301,7 +263,6 @@ try:
 
     st.markdown("---")
 
-    # --- 핵심 포트폴리오 스냅샷 (UI 극대화) ---
     st.subheader("📊 핵심 포트폴리오 스냅샷")
     if not df_port.empty:
         df_display = pd.DataFrame()
@@ -333,7 +294,6 @@ try:
 
     st.markdown("---")
 
-    # --- AI 리포트 ---
     st.subheader("🤖 AI 리포트 브리핑 룸")
     if latest_ai_report:
         st.caption(f"📅 리포트 공시 시점: {latest_ai_report.get('Date', 'N/A')}")
