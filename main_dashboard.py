@@ -47,6 +47,8 @@ def get_usd_krw_rate():
 def load_data():
     client = get_sheet_client()
     doc = client.open_by_key(SPREADSHEET_ID)
+    
+    # 에러를 무시하지 않고 화면에 직접 띄워주는 강력한 fetcher
     def fetch_sheet(name):
         try:
             worksheet = doc.worksheet(name)
@@ -55,7 +57,10 @@ def load_data():
             df = pd.DataFrame(vals[1:], columns=vals[0])
             df.columns = df.columns.astype(str).str.strip()
             return df
-        except: return pd.DataFrame()
+        except Exception as e:
+            st.error(f"⚠️ '{name}' 시트 로딩 중 에러 발생: {e}")
+            return pd.DataFrame()
+            
     return fetch_sheet("Portfolio"), fetch_sheet("History"), (doc.worksheet("AI_Reports").get_all_records()[-1] if doc.worksheet("AI_Reports").get_all_records() else None)
 
 def clean_numeric(series):
@@ -65,7 +70,6 @@ def clean_numeric(series):
 def calc_delta(df_hist, account_type=None):
     if df_hist.empty or 'Date' not in df_hist.columns or 'Total_Value_KRW' not in df_hist.columns: return 0, 0
     df = df_hist.copy()
-    # [수정 1] 타임라인이 오전/오후 두 점을 인식하도록 dt.normalize() 제거
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce') 
     df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
     df = df.dropna(subset=['Date'])
@@ -197,7 +201,6 @@ try:
     with g2:
         st.subheader("🍕 ML 기반 섹터별 심층 비중 (Treemap)")
         if not df_port.empty:
-            # [수정 2] 트리맵 렌더링 버그 원천 차단 (가상 뿌리 제거, 실제 열 삽입)
             df_port['Root'] = '전체 포트폴리오'
             fig = px.treemap(
                 df_port, 
@@ -220,7 +223,6 @@ try:
         try:
             end = datetime.datetime.now()
             start = end - datetime.timedelta(days=365)
-            # [수정 3] yfinance 구조 변경으로 인한 Series 에러 해결 (단일 Ticker 모드 적용)
             df_spy = yf.Ticker('^GSPC').history(start=start, end=end)
             spy_close = df_spy['Close']
             
