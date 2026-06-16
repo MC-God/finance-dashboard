@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import json
+import re
 import requests
 import datetime
 import plotly.express as px
@@ -87,34 +88,93 @@ def calc_delta(df_hist, account_type=None):
     pct = (diff / snapshot_sums.iloc[-2] * 100) if snapshot_sums.iloc[-2] != 0 else 0
     return diff, pct
 
+# [개선 1] AI 응답에서 순수 JSON만 안전하게 추출
+def extract_json_from_text(text: str):
+    cleaned = re.sub(r'```json\n|```', '', text).strip()
+    match = re.search(r'(\[.*\]|\{.*\})', cleaned, re.DOTALL)
+    if match: return json.loads(match.group(1))
+    return json.loads(cleaned)
+
+# [개선 3] 글로벌 택소노미 통합 사전 (영문 -> 한글 매핑)
+YF_SECTOR_MAP = {
+    'Technology': '빅테크/IT',
+    'Financial Services': '금융/산업재',
+    'Healthcare': '바이오/헬스케어',
+    'Consumer Cyclical': '소비재',
+    'Consumer Defensive': '소비재',
+    'Industrials': '금융/산업재',
+    'Energy': '기타 산업군',
+    'Utilities': '기타 산업군',
+    'Basic Materials': '금융/산업재',
+    'Communication Services': '빅테크/IT',
+    'Real Estate': '대체자산/부동산'
+}
+
 @st.cache_data(ttl=604800)
 def get_smart_sectors(portfolio_dicts):
     sector_map = {}
     unclassified = []
     for row in portfolio_dicts:
         t, n, c = row['Ticker'], row['Stock_Name'], row['Currency']
+        n_lower = str(n).lower()
+        t_lower = str(t).lower()
+        
+        # [개선 2] 초고속 1차 필터링 (명확한 대형주 및 지수 ETF 하드코딩)
+        if any(x in n_lower or x in t_lower for x in ['spy', 'voo', 'ivv', 'qqq', 'kodex 200', 'tiger 200', 's&p500', '나스닥', '지수', '코스피', '코스닥']):
+            sector_map[t] = '시장지수'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['배당', 'schd', 'jepi']):
+            sector_map[t] = '배당/인컴'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['금', 'gold', 'iau', '은', '현물']):
+            sector_map[t] = '안전자산'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['국채', 'tlt', 'tmf', '채권']):
+            sector_map[t] = '채권'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['엔비디아', 'nvda', 'soxl', 'soxs', 'sk하이닉스', '반도체', 'asml', 'amd', 'avgo', 'qcom', 'intc', 'arm', '한미반도체', '005930', '삼성전자']):
+            sector_map[t] = '반도체'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['애플', 'aapl', '마이크로소프트', 'msft', '구글', 'goog', '메타', 'meta', '소프트웨어', 'ai', '팔란티어', 'pltr', 'ibm', '035420', '네이버', '카카오']):
+            sector_map[t] = '빅테크/IT'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['바이오', '헬스케어', '팹트론', '메디톡스', '유한양행', '알테오젠', 'hlb', '쓰리빌리언']):
+            sector_map[t] = '바이오/헬스케어'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['테슬라', 'tsla', '현대차', '기아', '자동차', '모빌리티', '005380']):
+            sector_map[t] = '자동차/모빌리티'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['은행', '금융', '모건스탠리', '골드만삭스', 'jpm', 'ms', 'gs', 'kb금융', '신한지주', 'ls electric', '일렉트릭']):
+            sector_map[t] = '금융/산업재'
+            continue
+
+        # 2차 필터링: 미국 주식 yfinance API 추출 및 한글 번역
         if c == 'USD' and str(t).isalpha():
             try:
                 info = yf.Ticker(t).info
                 sec, ind = info.get('sector', ''), info.get('industry', '')
-                if 'Semiconductor' in ind: sector_map[t] = '반도체 (Semiconductors)'
-                elif 'Biotech' in ind or 'Health' in sec: sector_map[t] = '바이오/헬스케어 (Healthcare)'
+                if 'Semiconductor' in ind: sector_map[t] = '반도체'
+                elif 'Biotech' in ind or 'Health' in sec: sector_map[t] = '바이오/헬스케어'
                 elif sec:
-                    sector_map[t] = sec
+                    sector_map[t] = YF_SECTOR_MAP.get(sec, sec)
                     continue
             except: pass
+            
         if t not in sector_map:
             unclassified.append({"ticker": t, "name": n, "currency": c})
             
+    # 3차 필터링: 최종 미분류 종목 LLM 투입
     if unclassified and ai_client:
         prompt = """다음 리스트를 분석하여, 각 종목을 가장 적합한 하나로 맵핑해줘.
-        [반도체, 바이오/헬스케어, 빅테크/IT, 배당/인컴, 시장지수, 금융, 소비재, 자동차/모빌리티, 안전자산, 채권, 산업재, 기타]
-        오직 아래의 JSON 형식으로만 반환할 것. {"AAPL": "빅테크/IT", "005930": "반도체"}
+        [반도체, 바이오/헬스케어, 빅테크/IT, 배당/인컴, 시장지수, 금융/산업재, 소비재, 자동차/모빌리티, 안전자산, 채권, 기타]
+        오직 아래의 JSON 형식으로만 반환할 것. 다른 설명 절대 금지. {"AAPL": "빅테크/IT", "005930": "반도체"}
         종목 리스트: """ + str(unclassified)
         try:
             res = ai_client.models.generate_content(model='gemini-3.5-flash', contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json"))
-            sector_map.update(json.loads(res.text))
-        except: pass
+            ml_result = extract_json_from_text(res.text)
+            sector_map.update(ml_result)
+        except Exception as e:
+            print("ML Parse Error:", e)
     return sector_map
 
 st.title("🏦 포트폴리오 자산 운용 콕핏")
@@ -148,7 +208,7 @@ try:
         df_port['ROI'] = df_port.apply(lambda r: ((r['Total_Value_KRW'] - r['Total_Cost_KRW']) / r['Total_Cost_KRW'] * 100) if r['Total_Cost_KRW'] > 0 else 0, axis=1)
         
         sector_mapping = get_smart_sectors(df_port[['Ticker', 'Stock_Name', 'Currency']].to_dict('records'))
-        df_port['Sector'] = df_port['Ticker'].apply(lambda x: sector_mapping.get(str(x), '기타 산업군'))
+        df_port['Sector'] = df_port['Ticker'].apply(lambda x: sector_mapping.get(str(x), '기타'))
 
         total_asset = df_port['Total_Value_KRW'].sum()
         normal_asset = df_port[df_port['Account'] == '일반']['Total_Value_KRW'].sum()
@@ -163,8 +223,6 @@ try:
 
     st.markdown("### 🌍 글로벌 매크로 지표 (실시간)")
     macro_cols = st.columns(4)
-    
-    # [핵심] 5일 치 데이터를 호출하고 NaN을 버려서 휴장일 0.00%p 고정 버그 완벽 해결
     @st.cache_data(ttl=3600)
     def fetch_macro_indicators():
         try:
@@ -213,7 +271,6 @@ try:
                 df_total['Account'] = '총 자산'
                 df_timeline = pd.concat([df_timeline, df_total], ignore_index=True)
                 
-                # Plotly를 이용한 완벽한 시계열 연결
                 fig_line = px.line(
                     df_timeline, x='ExactDate', y='Total_Value_KRW', color='Account',
                     markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
@@ -300,7 +357,7 @@ try:
     st.subheader("📊 핵심 포트폴리오 스냅샷")
     if not df_port.empty:
         df_display = pd.DataFrame()
-        df_display['섹터(ML)'] = df_port['Sector']
+        df_display['섹터'] = df_port['Sector']
         df_display['종목명'] = df_port['Stock_Name']
         df_display['보유수량'] = df_port['Shares'].apply(lambda x: f"{int(x):,}" if float(x).is_integer() else f"{x:,.2f}")
         df_display['매수가'] = df_port.apply(lambda r: f"${r['Avg_Price']:,.2f}" if r['Currency'] == 'USD' else f"{int(r['Avg_Price']):,}원", axis=1)
@@ -312,7 +369,7 @@ try:
         df_display = df_display.sort_values(by='ROI_raw', ascending=False)
         df_display['수익률'] = df_display['ROI_raw'].apply(lambda x: f"▲ +{x:.2f}%" if x > 0 else f"▼ {x:.2f}%" if x < 0 else f"- {x:.2f}%")
         
-        display_columns = ['섹터(ML)', '종목명', '보유수량', '매수가', '현재가', '수익률']
+        display_columns = ['섹터', '종목명', '보유수량', '매수가', '현재가', '수익률']
         
         def style_roi_table(val):
             if '▲' in str(val): return 'color: #FF4B4B; font-weight: bold; background-color: rgba(255, 75, 75, 0.1);'
