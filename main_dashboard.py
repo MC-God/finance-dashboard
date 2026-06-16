@@ -62,25 +62,44 @@ def load_data():
             
     return fetch_sheet("Portfolio"), fetch_sheet("History"), (doc.worksheet("AI_Reports").get_all_records()[-1] if doc.worksheet("AI_Reports").get_all_records() else None)
 
-def clean_numeric(series):
-    cleaned = series.astype(str).str.replace(r'[^\d\.-]', '', regex=True)
-    return pd.to_numeric(cleaned, errors='coerce').fillna(0)
-
-# [핵심] 과거 9일, 10일의 날짜 형식을 11일과 동일하게 18시 정각으로 자동 변환하는 파서
-def parse_exact_date(date_series):
-    s = date_series.astype(str).str.strip()
-    s = s.apply(lambda x: x + " 18:00:00" if len(x) == 10 else x)
-    return pd.to_datetime(s, errors='coerce')
-
-def calc_delta(df_hist, account_type=None):
-    if df_hist.empty or 'Date' not in df_hist.columns or 'Total_Value_KRW' not in df_hist.columns: return 0, 0
-    df = df_hist.copy()
+# [핵심 방어막] History 데이터 중앙 세탁기 (날짜 보정 + 따옴표 제거 + 중복 스파이크 킬러)
+def clean_history_data(df_raw):
+    if df_raw.empty or 'Date' not in df_raw.columns:
+        return pd.DataFrame()
+        
+    df = df_raw.copy()
     
-    df['ExactDate'] = parse_exact_date(df['Date'])
-    df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
+    # 1. 날짜 시간 규격화 (시간 없으면 18:00:00 강제 부여)
+    df['ExactDate'] = df['Date'].astype(str).str.strip().apply(
+        lambda x: x + " 18:00:00" if len(x) == 10 else x
+    )
+    df['ExactDate'] = pd.to_datetime(df['ExactDate'], errors='coerce')
     df = df.dropna(subset=['ExactDate'])
     
-    if account_type and 'Account' in df.columns: df = df[df['Account'].str.strip() == account_type]
+    # 2. 티커 따옴표 벗기기 ('229200 -> 229200) - 과거 데이터와 신규 데이터 완벽 매칭
+    if 'Ticker' in df.columns:
+        df['Ticker'] = df['Ticker'].astype(str).str.replace("'", "", regex=False).str.strip()
+        
+    # 3. 자산 가치 숫자화
+    if 'Total_Value_KRW' in df.columns:
+        df['Total_Value_KRW'] = df['Total_Value_KRW'].astype(str).str.replace(r'[^\d\.-]', '', regex=True)
+        df['Total_Value_KRW'] = pd.to_numeric(df['Total_Value_KRW'], errors='coerce').fillna(0)
+        
+    if 'Account' in df.columns:
+        df['Account'] = df['Account'].astype(str).str.strip()
+        
+    # 4. 강력한 중복 제거 (스파이크 뻥튀기 원천 차단)
+    if 'Ticker' in df.columns and 'Account' in df.columns:
+        df = df.drop_duplicates(subset=['ExactDate', 'Ticker', 'Account'], keep='last')
+        
+    return df
+
+def calc_delta(df_clean, account_type=None):
+    if df_clean.empty: return 0, 0
+    df = df_clean.copy()
+    
+    if account_type and 'Account' in df.columns: 
+        df = df[df['Account'] == account_type]
     
     snapshot_sums = df.groupby('ExactDate')['Total_Value_KRW'].sum().sort_index()
     if len(snapshot_sums) < 2: return 0, 0
@@ -88,14 +107,12 @@ def calc_delta(df_hist, account_type=None):
     pct = (diff / snapshot_sums.iloc[-2] * 100) if snapshot_sums.iloc[-2] != 0 else 0
     return diff, pct
 
-# [개선 1] AI 응답에서 순수 JSON만 안전하게 추출
 def extract_json_from_text(text: str):
     cleaned = re.sub(r'```json\n|```', '', text).strip()
     match = re.search(r'(\[.*\]|\{.*\})', cleaned, re.DOTALL)
     if match: return json.loads(match.group(1))
     return json.loads(cleaned)
 
-# [개선 3] 글로벌 택소노미 통합 사전 (영문 -> 한글 매핑)
 YF_SECTOR_MAP = {
     'Technology': '빅테크/IT',
     'Financial Services': '금융/산업재',
@@ -119,7 +136,6 @@ def get_smart_sectors(portfolio_dicts):
         n_lower = str(n).lower()
         t_lower = str(t).lower()
         
-        # [개선 2] 초고속 1차 필터링 (명확한 대형주 및 지수 ETF 하드코딩)
         if any(x in n_lower or x in t_lower for x in ['spy', 'voo', 'ivv', 'qqq', 'kodex 200', 'tiger 200', 's&p500', '나스닥', '지수', '코스피', '코스닥']):
             sector_map[t] = '시장지수'
             continue
@@ -148,7 +164,6 @@ def get_smart_sectors(portfolio_dicts):
             sector_map[t] = '금융/산업재'
             continue
 
-        # 2차 필터링: 미국 주식 yfinance API 추출 및 한글 번역
         if c == 'USD' and str(t).isalpha():
             try:
                 info = yf.Ticker(t).info
@@ -163,7 +178,6 @@ def get_smart_sectors(portfolio_dicts):
         if t not in sector_map:
             unclassified.append({"ticker": t, "name": n, "currency": c})
             
-    # 3차 필터링: 최종 미분류 종목 LLM 투입
     if unclassified and ai_client:
         prompt = """다음 리스트를 분석하여, 각 종목을 가장 적합한 하나로 맵핑해줘.
         [반도체, 바이오/헬스케어, 빅테크/IT, 배당/인컴, 시장지수, 금융/산업재, 소비재, 자동차/모빌리티, 안전자산, 채권, 기타]
@@ -186,9 +200,12 @@ try:
     with st.spinner("데이터 동기화 및 ML 섹터 분류 중..."):
         df_port_raw, df_hist_raw, latest_ai_report = load_data()
 
-    total_diff, total_pct = calc_delta(df_hist_raw)
-    normal_diff, normal_pct = calc_delta(df_hist_raw, "일반")
-    pension_diff, pension_pct = calc_delta(df_hist_raw, "연금")
+    # 중앙 세탁기를 통과시킨 무결점 History 데이터 생성
+    df_hist_clean = clean_history_data(df_hist_raw)
+
+    total_diff, total_pct = calc_delta(df_hist_clean)
+    normal_diff, normal_pct = calc_delta(df_hist_clean, "일반")
+    pension_diff, pension_pct = calc_delta(df_hist_clean, "연금")
     total_asset, normal_asset, pension_asset = 0, 0, 0
 
     df_port = df_port_raw.copy()
@@ -208,7 +225,7 @@ try:
         df_port['ROI'] = df_port.apply(lambda r: ((r['Total_Value_KRW'] - r['Total_Cost_KRW']) / r['Total_Cost_KRW'] * 100) if r['Total_Cost_KRW'] > 0 else 0, axis=1)
         
         sector_mapping = get_smart_sectors(df_port[['Ticker', 'Stock_Name', 'Currency']].to_dict('records'))
-        df_port['Sector'] = df_port['Ticker'].apply(lambda x: sector_mapping.get(str(x), '기타'))
+        df_port['Sector'] = df_port['Ticker'].apply(lambda x: sector_mapping.get(str(x), '기타 산업군'))
 
         total_asset = df_port['Total_Value_KRW'].sum()
         normal_asset = df_port[df_port['Account'] == '일반']['Total_Value_KRW'].sum()
@@ -258,30 +275,22 @@ try:
     g1, g2 = st.columns([5, 5])
     with g1:
         st.subheader("📈 자산 성장 타임라인")
-        if not df_hist_raw.empty and 'Date' in df_hist_raw.columns:
-            df_chart = df_hist_raw.copy()
-            df_chart['ExactDate'] = parse_exact_date(df_chart['Date'])
-            df_chart['Total_Value_KRW'] = clean_numeric(df_chart['Total_Value_KRW'])
-            df_chart['Account'] = df_chart.get('Account', '일반').astype(str).str.strip()
-            df_chart = df_chart.dropna(subset=['ExactDate'])
+        if not df_hist_clean.empty:
+            df_timeline = df_hist_clean.groupby(['ExactDate', 'Account'])['Total_Value_KRW'].sum().reset_index()
+            df_total = df_timeline.groupby('ExactDate')['Total_Value_KRW'].sum().reset_index()
+            df_total['Account'] = '총 자산'
+            df_timeline = pd.concat([df_timeline, df_total], ignore_index=True)
             
-            if not df_chart.empty:
-                df_timeline = df_chart.groupby(['ExactDate', 'Account'])['Total_Value_KRW'].sum().reset_index()
-                df_total = df_timeline.groupby('ExactDate')['Total_Value_KRW'].sum().reset_index()
-                df_total['Account'] = '총 자산'
-                df_timeline = pd.concat([df_timeline, df_total], ignore_index=True)
-                
-                fig_line = px.line(
-                    df_timeline, x='ExactDate', y='Total_Value_KRW', color='Account',
-                    markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
-                )
-                fig_line.update_layout(
-                    margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
-                    xaxis_title=None, yaxis_title=None, legend_title=None,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                st.plotly_chart(fig_line, use_container_width=True)
-            else: st.info("차트를 그릴 수 있는 유효한 날짜 데이터가 없습니다.")
+            fig_line = px.line(
+                df_timeline, x='ExactDate', y='Total_Value_KRW', color='Account',
+                markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
+            )
+            fig_line.update_layout(
+                margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+                xaxis_title=None, yaxis_title=None, legend_title=None,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
         else: st.info("📅 아직 데이터 축적량이 부족합니다.")
 
     with g2:
