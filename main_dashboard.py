@@ -62,7 +62,17 @@ def load_data():
             
     return fetch_sheet("Portfolio"), fetch_sheet("History"), (doc.worksheet("AI_Reports").get_all_records()[-1] if doc.worksheet("AI_Reports").get_all_records() else None)
 
-# [핵심 방어막] History 데이터 중앙 세탁기 (날짜 보정 + 따옴표 제거 + 중복 스파이크 킬러)
+# [복구 완료] 콤마나 통화 기호를 지우고 숫자로 바꿔주는 필수 공용 함수
+def clean_numeric(series):
+    cleaned = series.astype(str).str.replace(r'[^\d\.-]', '', regex=True)
+    return pd.to_numeric(cleaned, errors='coerce').fillna(0)
+
+def parse_exact_date(date_series):
+    s = date_series.astype(str).str.strip()
+    s = s.apply(lambda x: x + " 18:00:00" if len(x) == 10 else x)
+    return pd.to_datetime(s, errors='coerce')
+
+# History 데이터 중앙 세탁기 (날짜 보정 + 따옴표 제거 + 중복 스파이크 킬러)
 def clean_history_data(df_raw):
     if df_raw.empty or 'Date' not in df_raw.columns:
         return pd.DataFrame()
@@ -70,20 +80,16 @@ def clean_history_data(df_raw):
     df = df_raw.copy()
     
     # 1. 날짜 시간 규격화 (시간 없으면 18:00:00 강제 부여)
-    df['ExactDate'] = df['Date'].astype(str).str.strip().apply(
-        lambda x: x + " 18:00:00" if len(x) == 10 else x
-    )
-    df['ExactDate'] = pd.to_datetime(df['ExactDate'], errors='coerce')
+    df['ExactDate'] = parse_exact_date(df['Date'])
     df = df.dropna(subset=['ExactDate'])
     
-    # 2. 티커 따옴표 벗기기 ('229200 -> 229200) - 과거 데이터와 신규 데이터 완벽 매칭
+    # 2. 티커 따옴표 벗기기 ('229200 -> 229200)
     if 'Ticker' in df.columns:
         df['Ticker'] = df['Ticker'].astype(str).str.replace("'", "", regex=False).str.strip()
         
     # 3. 자산 가치 숫자화
     if 'Total_Value_KRW' in df.columns:
-        df['Total_Value_KRW'] = df['Total_Value_KRW'].astype(str).str.replace(r'[^\d\.-]', '', regex=True)
-        df['Total_Value_KRW'] = pd.to_numeric(df['Total_Value_KRW'], errors='coerce').fillna(0)
+        df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
         
     if 'Account' in df.columns:
         df['Account'] = df['Account'].astype(str).str.strip()
