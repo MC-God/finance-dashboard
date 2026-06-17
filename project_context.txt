@@ -1,0 +1,1506 @@
+# [Project Full Context]
+이 파일은 현재 헤지펀드 대시보드 프로젝트의 전체 디렉토리 및 파일 구조를 담고 있습니다.
+
+============================================================
+📁 File Path: ./main_dashboard.py
+============================================================
+import streamlit as st
+import pandas as pd
+import os
+import json
+import re
+import requests
+import datetime
+import plotly.express as px
+import yfinance as yf
+import FinanceDataReader as fdr
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+from src.sheets_client import get_sheet_client
+
+st.set_page_config(page_title="Hedge Fund Style Cockpit", page_icon="🏦", layout="wide")
+
+st.markdown("""
+    <style>
+    .metric-card { background-color: #1e222b; padding: 20px; border-radius: 8px; border: 1px solid #2e3440; }
+    .metric-title { color: #b0b5c0; font-size: 15px; margin-bottom: 5px; font-weight: 600; }
+    .metric-value { color: white; margin: 0; font-size: 32px; letter-spacing: -0.5px; }
+    .metric-unit { font-size: 16px; font-weight: normal; color: #888; }
+    .report-box { background-color: #1a1c23; padding: 25px; border-radius: 10px; border-left: 5px solid #FF4B4B; margin-bottom: 20px; line-height: 1.6; }
+    </style>
+""", unsafe_allow_html=True)
+
+if "google_credentials" in st.secrets:
+    try:
+        with open("credentials.json", "w", encoding="utf-8") as f:
+            json.dump(dict(st.secrets["google_credentials"]), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.error(f"인증서 설정 오류: {e}")
+
+load_dotenv()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or st.secrets.get("SPREADSHEET_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+def get_usd_krw_rate():
+    try:
+        res = requests.get("https://open.er-api.com/v6/latest/USD", timeout=3)
+        if res.status_code == 200: return float(res.json()["rates"]["KRW"])
+    except: pass
+    return 1350.0
+
+@st.cache_data(ttl=30)
+def load_data():
+    client = get_sheet_client()
+    doc = client.open_by_key(SPREADSHEET_ID)
+    def fetch_sheet(name):
+        try:
+            worksheet = doc.worksheet(name)
+            vals = worksheet.get_all_values()
+            if not vals: return pd.DataFrame()
+            df = pd.DataFrame(vals[1:], columns=vals[0])
+            df.columns = df.columns.astype(str).str.strip()
+            return df
+        except Exception as e:
+            st.error(f"⚠️ '{name}' 시트 로딩 중 에러 발생: {e}")
+            return pd.DataFrame()
+            
+    return fetch_sheet("Portfolio"), fetch_sheet("History"), (doc.worksheet("AI_Reports").get_all_records()[-1] if doc.worksheet("AI_Reports").get_all_records() else None)
+
+def clean_numeric(series):
+    cleaned = series.astype(str).str.replace(r'[^\d\.-]', '', regex=True)
+    return pd.to_numeric(cleaned, errors='coerce').fillna(0)
+
+def parse_exact_date(date_series):
+    s = date_series.astype(str).str.strip()
+    s = s.apply(lambda x: x + " 18:00:00" if len(x) == 10 else x)
+    return pd.to_datetime(s, errors='coerce')
+
+def clean_history_data(df_raw):
+    if df_raw.empty or 'Date' not in df_raw.columns:
+        return pd.DataFrame()
+        
+    df = df_raw.copy()
+    
+    df['ExactDate'] = parse_exact_date(df['Date'])
+    df = df.dropna(subset=['ExactDate'])
+    
+    if 'Ticker' in df.columns:
+        df['Ticker'] = df['Ticker'].astype(str).str.replace("'", "", regex=False).str.strip()
+        
+    if 'Total_Value_KRW' in df.columns:
+        df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
+        
+    if 'Account' in df.columns:
+        df['Account'] = df['Account'].astype(str).str.strip()
+        
+    if 'Ticker' in df.columns and 'Account' in df.columns:
+        df = df.drop_duplicates(subset=['ExactDate', 'Ticker', 'Account'], keep='last')
+        
+    return df
+
+def calc_delta(df_clean, account_type=None):
+    if df_clean.empty: return 0, 0
+    df = df_clean.copy()
+    
+    if account_type and 'Account' in df.columns: 
+        df = df[df['Account'] == account_type]
+    
+    snapshot_sums = df.groupby('ExactDate')['Total_Value_KRW'].sum().sort_index()
+    if len(snapshot_sums) < 2: return 0, 0
+    diff = snapshot_sums.iloc[-1] - snapshot_sums.iloc[-2]
+    pct = (diff / snapshot_sums.iloc[-2] * 100) if snapshot_sums.iloc[-2] != 0 else 0
+    return diff, pct
+
+def extract_json_from_text(text: str):
+    cleaned = re.sub(r'```json\n|```', '', text).strip()
+    match = re.search(r'(\[.*\]|\{.*\})', cleaned, re.DOTALL)
+    if match: return json.loads(match.group(1))
+    return json.loads(cleaned)
+
+YF_SECTOR_MAP = {
+    'Technology': '빅테크/IT',
+    'Financial Services': '금융/산업재',
+    'Healthcare': '바이오/헬스케어',
+    'Consumer Cyclical': '소비재',
+    'Consumer Defensive': '소비재',
+    'Industrials': '금융/산업재',
+    'Energy': '기타 산업군',
+    'Utilities': '기타 산업군',
+    'Basic Materials': '금융/산업재',
+    'Communication Services': '빅테크/IT',
+    'Real Estate': '대체자산/부동산'
+}
+
+@st.cache_data(ttl=604800)
+def get_smart_sectors(portfolio_dicts):
+    sector_map = {}
+    unclassified = []
+    for row in portfolio_dicts:
+        t, n, c = row['Ticker'], row['Stock_Name'], row['Currency']
+        n_lower = str(n).lower()
+        t_lower = str(t).lower()
+        
+        if any(x in n_lower or x in t_lower for x in ['spy', 'voo', 'ivv', 'qqq', 'kodex 200', 'tiger 200', 's&p500', '나스닥', '지수', '코스피', '코스닥']):
+            sector_map[t] = '시장지수'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['배당', 'schd', 'jepi']):
+            sector_map[t] = '배당/인컴'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['금', 'gold', 'iau', '은', '현물']):
+            sector_map[t] = '안전자산'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['국채', 'tlt', 'tmf', '채권']):
+            sector_map[t] = '채권'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['엔비디아', 'nvda', 'soxl', 'soxs', 'sk하이닉스', '반도체', 'asml', 'amd', 'avgo', 'qcom', 'intc', 'arm', '한미반도체', '005930', '삼성전자']):
+            sector_map[t] = '반도체'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['애플', 'aapl', '마이크로소프트', 'msft', '구글', 'goog', '메타', 'meta', '소프트웨어', 'ai', '팔란티어', 'pltr', 'ibm', '035420', '네이버', '카카오']):
+            sector_map[t] = '빅테크/IT'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['바이오', '헬스케어', '팹트론', '메디톡스', '유한양행', '알테오젠', 'hlb', '쓰리빌리언']):
+            sector_map[t] = '바이오/헬스케어'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['테슬라', 'tsla', '현대차', '기아', '자동차', '모빌리티', '005380']):
+            sector_map[t] = '자동차/모빌리티'
+            continue
+        if any(x in n_lower or x in t_lower for x in ['은행', '금융', '모건스탠리', '골드만삭스', 'jpm', 'ms', 'gs', 'kb금융', '신한지주', 'ls electric', '일렉트릭']):
+            sector_map[t] = '금융/산업재'
+            continue
+
+        if c == 'USD' and str(t).isalpha():
+            try:
+                info = yf.Ticker(t).info
+                sec, ind = info.get('sector', ''), info.get('industry', '')
+                if 'Semiconductor' in ind: sector_map[t] = '반도체'
+                elif 'Biotech' in ind or 'Health' in sec: sector_map[t] = '바이오/헬스케어'
+                elif sec:
+                    sector_map[t] = YF_SECTOR_MAP.get(sec, sec)
+                    continue
+            except: pass
+            
+        if t not in sector_map:
+            unclassified.append({"ticker": t, "name": n, "currency": c})
+            
+    if unclassified and ai_client:
+        prompt = """다음 리스트를 분석하여, 각 종목을 가장 적합한 하나로 맵핑해줘.
+        [반도체, 바이오/헬스케어, 빅테크/IT, 배당/인컴, 시장지수, 금융/산업재, 소비재, 자동차/모빌리티, 안전자산, 채권, 기타]
+        오직 아래의 JSON 형식으로만 반환할 것. 다른 설명 절대 금지. {"AAPL": "빅테크/IT", "005930": "반도체"}
+        종목 리스트: """ + str(unclassified)
+        try:
+            res = ai_client.models.generate_content(model='gemini-3.5-flash', contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json"))
+            ml_result = extract_json_from_text(res.text)
+            sector_map.update(ml_result)
+        except Exception as e:
+            print("ML Parse Error:", e)
+    return sector_map
+
+st.title("🏦 포트폴리오 자산 운용 콕핏")
+
+try:
+    usd_krw = get_usd_krw_rate()
+    st.caption(f"📡 실시간 고시 환율 기준: 1 USD = {usd_krw:,.2f} KRW")
+
+    with st.spinner("데이터 동기화 및 ML 섹터 분류 중..."):
+        df_port_raw, df_hist_raw, latest_ai_report = load_data()
+
+    df_hist_clean = clean_history_data(df_hist_raw)
+
+    total_diff, total_pct = calc_delta(df_hist_clean)
+    normal_diff, normal_pct = calc_delta(df_hist_clean, "일반")
+    pension_diff, pension_pct = calc_delta(df_hist_clean, "연금")
+    total_asset, normal_asset, pension_asset = 0, 0, 0
+
+    df_port = df_port_raw.copy()
+    if not df_port.empty:
+        df_port['Ticker'] = df_port['Ticker'].astype(str).str.replace("'", "") 
+        df_port['Shares'] = clean_numeric(df_port.get('Shares', pd.Series([0]*len(df_port))))
+        df_port['Current_Price'] = clean_numeric(df_port.get('Current_Price', pd.Series([0]*len(df_port))))
+        df_port['Avg_Price'] = clean_numeric(df_port.get('Avg_Price', pd.Series([0]*len(df_port))))
+        df_port['Currency'] = df_port.get('Currency', pd.Series(['KRW']*len(df_port))).astype(str).str.strip().str.upper()
+        df_port['Account'] = df_port.get('Account', pd.Series(['일반']*len(df_port))).astype(str).str.strip()
+
+        def get_krw_val(row, price_col):
+            return row[price_col] * row['Shares'] * usd_krw if row['Currency'] == 'USD' else row[price_col] * row['Shares']
+
+        df_port['Total_Value_KRW'] = df_port.apply(lambda r: get_krw_val(r, 'Current_Price'), axis=1)
+        df_port['Total_Cost_KRW'] = df_port.apply(lambda r: get_krw_val(r, 'Avg_Price'), axis=1)
+        df_port['ROI'] = df_port.apply(lambda r: ((r['Total_Value_KRW'] - r['Total_Cost_KRW']) / r['Total_Cost_KRW'] * 100) if r['Total_Cost_KRW'] > 0 else 0, axis=1)
+        
+        sector_mapping = get_smart_sectors(df_port[['Ticker', 'Stock_Name', 'Currency']].to_dict('records'))
+        df_port['Sector'] = df_port['Ticker'].apply(lambda x: sector_mapping.get(str(x), '기타 산업군'))
+
+        total_asset = df_port['Total_Value_KRW'].sum()
+        normal_asset = df_port[df_port['Account'] == '일반']['Total_Value_KRW'].sum()
+        pension_asset = df_port[df_port['Account'] == '연금']['Total_Value_KRW'].sum()
+
+    def render_card(title, value, diff, pct=None, unit="원"):
+        color, arrow, sign = ("#FF4B4B", "▲", "+") if diff > 0 else ("#1C83E1", "▼", "") if diff < 0 else ("#888888", "-", "")
+        value_fmt = f"{value:,.0f}" if unit == "원" else f"{value:.2f}"
+        diff_fmt = f"{diff:,.0f} {unit}" if unit == "원" else f"{diff:.2f}%p"
+        pct_str = f" ({sign}{pct:.2f}%)" if pct is not None else ""
+        return f"""<div class="metric-card"><p class="metric-title">{title}</p><h2 class="metric-value">{value_fmt} <span class="metric-unit">{unit}</span></h2><p style="color: {color}; margin-top: 8px; font-size: 15px; margin-bottom: 0; font-weight: 500;">{arrow} {sign}{diff_fmt}{pct_str}</p></div>"""
+
+    st.markdown("### 🌍 글로벌 매크로 지표 (실시간)")
+    macro_cols = st.columns(4)
+    @st.cache_data(ttl=3600)
+    def fetch_macro_indicators():
+        try:
+            tickers = {"5Y": "^FVX", "10Y": "^TNX", "30Y": "^TYX", "VIX": "^VIX"}
+            res = {}
+            for name, t in tickers.items():
+                df = yf.Ticker(t).history(period="5d").dropna(subset=['Close'])
+                if len(df) >= 2:
+                    val = float(df['Close'].iloc[-1])
+                    diff = val - float(df['Close'].iloc[-2])
+                elif len(df) == 1:
+                    val = float(df['Close'].iloc[-1])
+                    diff = 0.0
+                else:
+                    val, diff = 0.0, 0.0
+                res[name] = (val, diff)
+            return res
+        except: return {"5Y":(0,0), "10Y":(0,0), "30Y":(0,0), "VIX":(0,0)}
+
+    macro_data = fetch_macro_indicators()
+    with macro_cols[0]: st.markdown(render_card("🇺🇸 미 5년물 국채", macro_data["5Y"][0], macro_data["5Y"][1], unit="%"), unsafe_allow_html=True)
+    with macro_cols[1]: st.markdown(render_card("🇺🇸 미 10년물 국채", macro_data["10Y"][0], macro_data["10Y"][1], unit="%"), unsafe_allow_html=True)
+    with macro_cols[2]: st.markdown(render_card("🇺🇸 미 30년물 국채", macro_data["30Y"][0], macro_data["30Y"][1], unit="%"), unsafe_allow_html=True)
+    with macro_cols[3]: st.markdown(render_card("📉 VIX (공포지수)", macro_data["VIX"][0], macro_data["VIX"][1], unit="pt"), unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns(3)
+    with col1: st.markdown(render_card("💰 총 자산 합계", total_asset, total_diff, total_pct, "원"), unsafe_allow_html=True)
+    with col2: st.markdown(render_card("💵 일반 주식계좌 자산", normal_asset, normal_diff, normal_pct, "원"), unsafe_allow_html=True)
+    with col3: st.markdown(render_card("🛡️ 연금저축/IRP 자산", pension_asset, pension_diff, pension_pct, "원"), unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # --- 여기서부터 1열 2행(상하 레이아웃)으로 변경된 부분입니다 ---
+
+    # 1. 상단: 자산 성장 타임라인 (넓고 시원하게)
+    st.subheader("📈 자산 성장 타임라인")
+    if not df_hist_clean.empty:
+        df_timeline = df_hist_clean.groupby(['ExactDate', 'Account'])['Total_Value_KRW'].sum().reset_index()
+        df_total = df_timeline.groupby('ExactDate')['Total_Value_KRW'].sum().reset_index()
+        df_total['Account'] = '총 자산'
+        df_timeline = pd.concat([df_timeline, df_total], ignore_index=True)
+        
+        fig_line = px.line(
+            df_timeline, x='ExactDate', y='Total_Value_KRW', color='Account',
+            markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
+        )
+        fig_line.update_layout(
+            height=450, # 세로 길이를 늘려 가시성 확보
+            margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+            xaxis_title=None, yaxis_title=None, legend_title=None,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_line, use_container_width=True)
+    else: 
+        st.info("📅 아직 데이터 축적량이 부족합니다.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # 2. 하단: 섹터별 심층 비중 트리맵 (넓은 화면을 활용해 텍스트 가독성 극대화)
+    st.subheader("🍕 ML 기반 섹터별 심층 비중 (Treemap)")
+    if not df_port.empty:
+        df_port['Root'] = '전체 포트폴리오'
+        fig_tree = px.treemap(
+            df_port, 
+            path=['Root', 'Sector', 'Stock_Name'], 
+            values='Total_Value_KRW',
+            color='ROI',
+            color_continuous_scale=['#1C83E1', '#2e3440', '#FF4B4B'],
+            color_continuous_midpoint=0
+        )
+        fig_tree.update_layout(
+            height=550, # 트리맵도 화면 전체 너비를 쓰도록 높이 상향 조정
+            margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)'
+        )
+        st.plotly_chart(fig_tree, use_container_width=True)
+
+    st.markdown("---")
+
+    st.subheader("🛡️ 리스크 관리 & 벤치마크 (1Y)")
+    st.caption("내 포트폴리오의 과거 데이터가 30일 이상 축적되면 포트폴리오 자체의 MDD와 Beta 연산도 이곳에 활성화됩니다.")
+    
+    @st.cache_data(ttl=3600)
+    def fetch_benchmarks():
+        try:
+            end = datetime.datetime.now()
+            start = end - datetime.timedelta(days=365)
+            
+            df_spy = yf.Ticker('^GSPC').history(start=start, end=end)
+            spy_close = df_spy['Close'].dropna() 
+            
+            df_kospi = yf.Ticker('^KS11').history(start=start, end=end)
+            kospi_close = df_kospi['Close'].dropna() 
+            
+            def get_risk_metrics(series):
+                if series.empty: return 0.0, 0.0, 0.0
+                v_start = float(series.values[0])
+                v_end = float(series.values[-1])
+                ret = (v_end / v_start - 1) * 100 if v_start != 0 else 0
+                roll_max = series.cummax()
+                drawdown = (series / roll_max - 1) * 100
+                return float(ret), float(drawdown.min()), float(drawdown.values[-1])
+                
+            spy_ret, spy_mdd, spy_cdd = get_risk_metrics(spy_close)
+            kospi_ret, kospi_mdd, kospi_cdd = get_risk_metrics(kospi_close)
+            return spy_ret, spy_mdd, spy_cdd, kospi_ret, kospi_mdd, kospi_cdd
+        except Exception as e:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    sr, sm, sc, kr, km, kc = fetch_benchmarks()
+    bm_cols = st.columns(2)
+    with bm_cols[0]:
+        st.markdown(f"""
+        <div class="metric-card" style="border-left: 5px solid #FBC02D;">
+            <p class="metric-title">🇺🇸 S&P 500 (1년 지표)</p>
+            <p>누적 수익률: <b style="color: {'#FF4B4B' if sr>0 else '#1C83E1'};">{'+' if sr>0 else ''}{sr:.2f}%</b></p>
+            <p>최대 낙폭 (MDD): <b style="color: #1C83E1;">{sm:.2f}%</b></p>
+            <p>현재 고점 대비: <b>{sc:.2f}%</b></p>
+        </div>
+        """, unsafe_allow_html=True)
+    with bm_cols[1]:
+        st.markdown(f"""
+        <div class="metric-card" style="border-left: 5px solid #1C83E1;">
+            <p class="metric-title">🇰🇷 KOSPI (1년 지표)</p>
+            <p>누적 수익률: <b style="color: {'#FF4B4B' if kr>0 else '#1C83E1'};">{'+' if kr>0 else ''}{kr:.2f}%</b></p>
+            <p>최대 낙폭 (MDD): <b style="color: #1C83E1;">{km:.2f}%</b></p>
+            <p>현재 고점 대비: <b>{kc:.2f}%</b></p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    st.subheader("📊 핵심 포트폴리오 스냅샷")
+    if not df_port.empty:
+        df_display = pd.DataFrame()
+        df_display['섹터'] = df_port['Sector']
+        df_display['종목명'] = df_port['Stock_Name']
+        df_display['보유수량'] = df_port['Shares'].apply(lambda x: f"{int(x):,}" if float(x).is_integer() else f"{x:,.2f}")
+        df_display['매수가'] = df_port.apply(lambda r: f"${r['Avg_Price']:,.2f}" if r['Currency'] == 'USD' else f"{int(r['Avg_Price']):,}원", axis=1)
+        df_display['현재가'] = df_port.apply(lambda r: f"${r['Current_Price']:,.2f}" if r['Currency'] == 'USD' else f"{int(r['Current_Price']):,}원", axis=1)
+        
+        df_display['ROI_raw'] = df_port['ROI']
+        df_display['계좌'] = df_port['Account']
+        
+        df_display = df_display.sort_values(by='ROI_raw', ascending=False)
+        df_display['수익률'] = df_display['ROI_raw'].apply(lambda x: f"▲ +{x:.2f}%" if x > 0 else f"▼ {x:.2f}%" if x < 0 else f"- {x:.2f}%")
+        
+        display_columns = ['섹터', '종목명', '보유수량', '매수가', '현재가', '수익률']
+        
+        def style_roi_table(val):
+            if '▲' in str(val): return 'color: #FF4B4B; font-weight: bold; background-color: rgba(255, 75, 75, 0.1);'
+            elif '▼' in str(val): return 'color: #1C83E1; font-weight: bold; background-color: rgba(28, 131, 225, 0.1);'
+            return 'color: #888888;'
+            
+        tab1, tab2, tab3 = st.tabs(["전체", "일반", "연금"])
+        with tab1: st.dataframe(df_display[display_columns].style.map(style_roi_table, subset=['수익률']), use_container_width=True, hide_index=True)
+        with tab2: st.dataframe(df_display[df_display['계좌'] == '일반'][display_columns].style.map(style_roi_table, subset=['수익률']), use_container_width=True, hide_index=True)
+        with tab3: st.dataframe(df_display[df_display['계좌'] == '연금'][display_columns].style.map(style_roi_table, subset=['수익률']), use_container_width=True, hide_index=True)
+    else:
+        st.info("조회할 장부가 비어 있습니다.")
+
+    st.markdown("---")
+
+    st.subheader("🤖 AI 리포트 브리핑 룸")
+    if latest_ai_report:
+        st.caption(f"📅 리포트 공시 시점: {latest_ai_report.get('Date', 'N/A')}")
+        tabs = st.tabs(["📉 퀀트", "🌍 매크로", "💎 가치투자", "🚀 텐베거"])
+        sections = [("시스템 퀀트 분석", 'Quant_Opinion'), ("글로벌 매크로 환경", 'Macro_Opinion'), ("기본적 가치 분석", 'Value_Opinion'), ("텐베거 탐색", 'Ten_Bagger_Opinion')]
+        
+        for tab, (title, key) in zip(tabs, sections):
+            with tab:
+                st.markdown(f"<div class='report-box'>{latest_ai_report.get(key, '내용이 없습니다.')}</div>", unsafe_allow_html=True)
+
+except Exception as e:
+    st.error(f"대시보드 구동 중 시스템 오류 발생: {e}")
+
+============================================================
+📁 File Path: ./migrate_db.py
+============================================================
+# migrate_db.py
+import os
+from dotenv import load_dotenv
+from src.sheets_client import get_sheet_client
+
+load_dotenv()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+
+def run_migration():
+    print("🚀 구글 시트 마이그레이션을 시작합니다...")
+    client = get_sheet_client()
+    doc = client.open_by_key(SPREADSHEET_ID)
+
+    # 1. Realized_PnL 시트가 없으면 생성
+    try:
+        pnl_sheet = doc.worksheet("Realized_PnL")
+        print("✅ 'Realized_PnL' 시트가 이미 존재합니다.")
+    except:
+        pnl_sheet = doc.add_worksheet(title="Realized_PnL", rows="1000", cols="10")
+        print("✅ 'Realized_PnL' 시트를 새로 생성했습니다.")
+
+    # 2. 헤더 초기화 (데이터 꼬임 방지)
+    pnl_header = ["Date", "Ticker", "Account", "Currency", "Sold_Shares", "Sell_Price", "Avg_Cost", "Realized_PnL"]
+    pnl_sheet.clear()
+    pnl_sheet.append_row(pnl_header)
+    print("✅ 'Realized_PnL' 헤더 셋업 완료.")
+    
+    print("🎉 DB 마이그레이션이 완료되었습니다! 이제 구글 시트에 직접 들어갈 필요가 없습니다.")
+
+if __name__ == "__main__":
+    run_migration()
+
+
+============================================================
+📁 File Path: ./batch_daily.py
+============================================================
+import os
+import sys
+import datetime
+import pandas as pd
+import requests
+import yfinance as yf
+import FinanceDataReader as fdr
+from dotenv import load_dotenv
+from src.sheets_client import get_sheet_client
+from src.ai_agent import analyze_portfolio
+
+load_dotenv()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+
+US_STOCK_NAME_REGISTRY = {
+    '0013P0': 'RISE 미국은행TOP10', 
+    'TSLA': '테슬라', 'AAPL': '애플', 'NVDA': '엔비디아', 'MSFT': '마이크로소프트',
+    'GOOGL': '구글(알파벳 A)', 'GOOG': '구글(알파벳 C)', 'AMZN': '아마존', 'META': '메타',
+    'NFLX': '넷플릭스', 'AMD': 'AMD', 'AVGO': '브로드컴', 'COST': '코스트코',
+    'SMCI': '슈퍼마이크로컴퓨터', 'ASML': 'ASML', 'QCOM': '퀄컴', 'INTC': '인텔',
+    'COIN': '코인베이스', 'NKE': '나이키', 'SBUX': '스타벅스', 'DIS': '디즈니',
+    'PLTR': '팔란티어', 'ARM': 'ARM 홀딩스', 'MS': '모건스탠리', 'GS': '골드만삭스', 'JPM': 'JP모건',
+    'SPY': 'SPY (S&P500)', 'VOO': 'VOO (S&P500)', 'IVV': 'IVV (S&P500)',
+    'QQQ': 'QQQ (나스닥100)', 'TQQQ': 'TQQQ (나스닥 3배 레버리지)', 'SQQQ': 'SQQQ (나스닥 3배 인버스)',
+    'SOXL': 'SOXL (반도체 3배 레버리지)', 'SOXS': 'SOXS (반도체 3배 인버스)',
+    'SCHD': 'SCHD (미국 배당성장)', 'JEPI': 'JEPI (JP모건 커버드콜)', 
+    'TLT': 'TLT (미 20년 국채)', 'TMF': 'TMF (미 국채 3배 레버리지)',
+    'TSLL': 'TSLL (테슬라 2배 레버리지)', 'NVDL': 'NVDL (엔비디아 2배 레버리지)',
+    'ARKX': 'ARKX (우주탐사 ETF)', 'XLY': 'XLY (소비재 ETF)', 'HON': '허니웰', 'IBM': 'IBM', 'ITB': 'ITB (미국주택 ETF)'
+}
+
+def get_usd_krw_rate():
+    try:
+        res = requests.get("https://open.er-api.com/v6/latest/USD", timeout=3)
+        if res.status_code == 200: return float(res.json()["rates"]["KRW"])
+    except: pass
+    return 1350.0
+
+def get_kst_now():
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)
+
+def run_daily_batch(mode="all"):
+    kst_now = get_kst_now()
+    snapshot_time = "06:00:00" if kst_now.hour < 12 else "18:00:00"
+    snapshot_date_str = f"{kst_now.strftime('%Y-%m-%d')} {snapshot_time}"
+    
+    print(f"🚀 일일 배치 작업 시작 (실행 모드: {mode}, 스냅샷 기준: {snapshot_date_str})")
+
+    client = get_sheet_client()
+    doc = client.open_by_key(SPREADSHEET_ID)
+    usd_krw = get_usd_krw_rate()
+
+    krx_name_registry = {}
+    print("📋 한국거래소(KRX) & ETF 마스터 레지스트리 동기화 중...")
+    try:
+        df_krx = fdr.StockListing('KRX')
+        krx_name_registry.update(dict(zip(df_krx['Code'].astype(str), df_krx['Name'].astype(str))))
+        df_etf = fdr.StockListing('ETF/KR')
+        code_col = 'Symbol' if 'Symbol' in df_etf.columns else df_etf.columns[0]
+        name_col = 'Name' if 'Name' in df_etf.columns else df_etf.columns[1]
+        krx_name_registry.update(dict(zip(df_etf[code_col].astype(str), df_etf[name_col].astype(str))))
+    except Exception as e:
+        print(f"⚠️ 레지스트리 로드 실패: {e}")
+
+    tx_records = doc.worksheet("Transaction").get_all_records()
+    holdings = {}
+    for row in tx_records:
+        row_clean = {str(k).strip().lower(): v for k, v in row.items()}
+        # [핵심 방어 1] Transaction 시트에서 티커를 읽을 때도 혹시 모를 따옴표를 모두 제거
+        ticker = str(row_clean.get('ticker', '')).replace("'", "").strip()
+        action = str(row_clean.get('type', '')).strip()
+        if not ticker: continue
+        if ticker.isdigit(): ticker = ticker.zfill(6)
+        
+        shares = float(str(row_clean.get('shares', '0')).replace(',', ''))
+        price = float(str(row_clean.get('price', '0')).replace(',', ''))
+        currency = str(row_clean.get('currency', 'KRW')).strip().upper()
+        account = str(row_clean.get('account', '일반')).strip()
+        
+        key = (ticker, account, currency)
+        if key not in holdings:
+            holdings[key] = {'shares': 0.0, 'total_cost': 0.0}
+        
+        if action in ['매수', 'buy', '입고']:
+            holdings[key]['shares'] += shares
+            holdings[key]['total_cost'] += (shares * price)
+        elif action in ['매도', 'sell', '출고']:
+            if holdings[key]['shares'] > 0:
+                avg_p = holdings[key]['total_cost'] / holdings[key]['shares']
+                holdings[key]['shares'] -= shares
+                holdings[key]['total_cost'] = holdings[key]['shares'] * avg_p
+            else:
+                holdings[key]['shares'] -= shares
+
+    port_sheet = doc.worksheet("Portfolio")
+    old_prices = {}
+    for r in port_sheet.get_all_records():
+        # [핵심 방어 2] Portfolio 시트에서 이전 가격을 읽을 때 따옴표를 완벽하게 제거하여 순수 매칭
+        t = str(r.get("Ticker", "")).replace("'", "").strip()
+        if t.isdigit(): t = t.zfill(6)
+        old_prices[t] = (r.get("Current_Price", 0), r.get("1D_Return", "0.00%"), str(r.get("Stock_Name", t)))
+
+    portfolio_rows = []
+    history_rows = []
+    portfolio_text_list = [] 
+
+    for key, data in holdings.items():
+        ticker, account, currency = key
+        shares = data['shares']
+        if shares <= 0: continue
+
+        avg_price = data['total_cost'] / shares
+        
+        is_kr = ticker.isdigit() or currency == 'KRW' or (any(c.isdigit() for c in ticker) and len(ticker) == 6)
+        
+        current_price = avg_price
+        one_day_return = "0.00%"
+        
+        # 따옴표가 제거된 순수 티커로 완벽 매칭 수행 (매수가로 덮어씌워지는 현상 차단)
+        if ticker in old_prices:
+            current_price, one_day_return, stock_name = old_prices[ticker]
+        else:
+            stock_name = krx_name_registry.get(ticker, ticker) if is_kr else US_STOCK_NAME_REGISTRY.get(ticker.upper(), ticker.upper())
+
+        should_fetch = True
+        if mode == "kr" and not is_kr: should_fetch = False
+        if mode == "us" and is_kr: should_fetch = False
+
+        if should_fetch:
+            print(f"[{ticker}] 최신 시세 동기화 중...")
+            try:
+                df_stock = pd.DataFrame()
+                if is_kr:
+                    try:
+                        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{ticker}"
+                        res = requests.get(url, timeout=5).json()
+                        item = res['result']['areas'][0]['datas'][0]
+                        current_price = float(item['nv'])
+                        raw_return = float(item['cr'])
+                        one_day_return = f"{raw_return:+.2f}%"
+                        stock_name = item['nm'] 
+                    except: pass
+                else: 
+                    df_stock = yf.Ticker(ticker).history(period="7d")
+                    if not df_stock.empty:
+                        df_stock = df_stock.dropna(subset=['Close'])
+                        if len(df_stock) >= 1:
+                            current_price = float(df_stock['Close'].iloc[-1])
+                            if len(df_stock) >= 2:
+                                prev_close = float(df_stock['Close'].iloc[-2])
+                                raw_return = ((current_price - prev_close) / prev_close) * 100
+                                one_day_return = f"{raw_return:+.2f}%"
+            except Exception as e:
+                print(f"⚠️ [{ticker}] 시세 연동 실패: {e}")
+
+        total_value_krw = shares * current_price * usd_krw if currency == 'USD' else shares * current_price
+        
+        # 다시 구글 시트에 안전하게 쓸 때는 보호막 생성
+        safe_ticker = f"'{ticker}" if is_kr else ticker
+        
+        portfolio_rows.append([safe_ticker, stock_name, shares, round(avg_price, 2), current_price, one_day_return, currency, account])
+        history_rows.append([snapshot_date_str, safe_ticker, stock_name, total_value_krw, account])
+        portfolio_text_list.append(f"Ticker: {ticker} | Name: {stock_name} | Shares: {shares} | Avg_Price: {avg_price:.2f} | Current_Price: {current_price:.2f} | 1D_Return: {one_day_return}")
+
+    port_sheet.clear()
+    port_headers = ["Ticker", "Stock_Name", "Shares", "Avg_Price", "Current_Price", "1D_Return", "Currency", "Account"]
+    port_sheet.append_row(port_headers)
+    if portfolio_rows: port_sheet.append_rows(portfolio_rows)
+
+    try: hist_sheet = doc.worksheet("History")
+    except: hist_sheet = doc.add_worksheet(title="History", rows="1000", cols="10")
+        
+    hist_header = ["Date", "Ticker", "Stock_Name", "Total_Value_KRW", "Account"]
+    all_hist_values = hist_sheet.get_all_values()
+    if not all_hist_values or all_hist_values[0][0] != "Date": hist_sheet.insert_row(hist_header, index=1)
+        
+    all_hist_records = hist_sheet.get_all_records()
+    if all_hist_records:
+        df_hist_temp = pd.DataFrame(all_hist_records)
+        for col in hist_header:
+            if col not in df_hist_temp.columns: df_hist_temp[col] = ""
+        df_hist_temp = df_hist_temp[hist_header]
+        
+        if 'Date' in df_hist_temp.columns:
+            df_keep = df_hist_temp[df_hist_temp['Date'].astype(str).str.strip() != snapshot_date_str]
+            hist_sheet.clear()
+            hist_sheet.append_row(hist_header)
+            if not df_keep.empty: hist_sheet.append_rows(df_keep.values.tolist())
+    else:
+        hist_sheet.clear()
+        hist_sheet.append_row(hist_header)
+
+    if history_rows: hist_sheet.append_rows(history_rows)
+    print("✅ 포트폴리오 및 히스토리 스냅샷 저장 완료!")
+
+    if mode in ["us", "all"]:
+        portfolio_data_str = "\n".join(portfolio_text_list)
+        if portfolio_data_str.strip():
+            print("🚀 [AI 분석] 4인 4색 페르소나 리포트 생성 중...")
+            personas = ["quant", "macro", "value", "ten_bagger"]
+            ai_results = {}
+            for p in personas:
+                print(f"🤖 [{p.upper()}] 분석 중...")
+                ai_results[p] = analyze_portfolio(portfolio_data_str, p)
+            
+            ai_reports_sheet = doc.worksheet("AI_Reports")
+            ai_reports_sheet.append_row([snapshot_date_str, ai_results["quant"], ai_results["macro"], ai_results["value"], ai_results["ten_bagger"]])
+            print("🎉 AI 분석 리포트 저장 완료!")
+
+if __name__ == "__main__":
+    run_mode = "all"
+    if len(sys.argv) > 1: run_mode = sys.argv[1].lower()
+    run_daily_batch(run_mode)
+
+
+============================================================
+📁 File Path: ./.gitignore
+============================================================
+# Environments
+.env
+__pycache__/
+*.pyc
+
+# Google Sheets Auth
+credentials.json
+
+# IDE / OS
+.vscode/
+.DS_Store
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#   Usually these files are written by a python script from a template
+#   before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+# Pipfile.lock
+
+# UV
+#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+# uv.lock
+
+# poetry
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+# poetry.lock
+# poetry.toml
+
+# pdm
+#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
+#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
+# pdm.lock
+# pdm.toml
+.pdm-python
+.pdm-build/
+
+# pixi
+#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
+# pixi.lock
+#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
+#   in the .venv directory. It is recommended not to include this directory in version control.
+.pixi
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# Redis
+*.rdb
+*.aof
+*.pid
+
+# RabbitMQ
+mnesia/
+rabbitmq/
+rabbitmq-data/
+
+# ActiveMQ
+activemq-data/
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#   and can be added to the global gitignore or merged into this file.  For a more nuclear
+#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
+# .idea/
+
+# Abstra
+#   Abstra is an AI-powered process automation framework.
+#   Ignore directories containing user credentials, local state, and settings.
+#   Learn more at https://abstra.io/docs
+.abstra/
+
+# Visual Studio Code
+#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
+#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#   you could uncomment the following to ignore the entire vscode folder
+# .vscode/
+# Temporary file for partial code execution
+tempCodeRunnerFile.py
+
+# Ruff stuff:
+.ruff_cache/
+
+# PyPI configuration file
+.pypirc
+
+# Marimo
+marimo/_static/
+marimo/_lsp/
+__marimo__/
+
+# Streamlit
+.streamlit/secrets.toml
+
+
+============================================================
+📁 File Path: ./requirements.txt
+============================================================
+gspread
+python-dotenv
+pandas
+finance-datareader
+google-genai
+streamlit
+python-telegram-bot
+yfinance
+pandas-datareader
+
+============================================================
+📁 File Path: ./README.md
+============================================================
+# finance-dashboard
+Developing financial dashboard for effective asset management
+
+
+============================================================
+📁 File Path: ./main_bot.py
+============================================================
+import os
+from dotenv import load_dotenv
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from src.bot_handlers import start_command, ai_report_command, handle_message, handle_photo, handle_callback_query
+
+# 환경변수 로드 (.env 파일 읽기)
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+def main():
+    # 토큰 체크 안전장치 (표준 규격: TELEGRAM_TOKEN)
+    if not TELEGRAM_TOKEN:
+        print("❌ 시스템 에러: .env 파일에 TELEGRAM_TOKEN이 설정되지 않았습니다.")
+        return
+
+    print("📡 [표준 규격] 텔레그램 봇 인프라 구축을 시작합니다...")
+    
+    # python-telegram-bot 애플리케이션 빌드
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # 1. 기본 명령어(/start, /ai) 핸들러 등록
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("ai", ai_report_command))
+    
+    # 2. 📸 보유현황 스크린샷 이미지 감지 핸들러 등록
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    
+    # 3. 🔘 일반계좌/연금계좌 선택 버튼 클릭 피드백 핸들러 등록
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
+    
+    # 4. 일반 텍스트 자연어 입력 처리 핸들러 등록 (명령어 제외)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    print("✅ 봇이 성공적으로 실행되었습니다. 텔레그램 앱에서 확인해보세요!")
+    
+    # 봇 가동 및 실시간 모니터링 시작 (Polling)
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
+
+
+============================================================
+📁 File Path: ./.github/workflows/kr_market.yml
+============================================================
+name: KR Market Update
+
+on:
+  schedule:
+    # UTC 09:00 = KST 18:00 (오후 6시 한국장 마감 반영)
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  update-kr-market:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: Python 환경 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 구글 인증키 생성
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+
+      - name: 한국장 데이터 업데이트 및 오후 스냅샷
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python batch_daily.py kr
+
+
+============================================================
+📁 File Path: ./.github/workflows/us_market.yml
+============================================================
+name: US Market & AI Analysis
+
+on:
+  schedule:
+    # UTC 21:00 = KST 06:00 (다음날 아침 6시 미국장 마감 반영)
+    - cron: '0 21 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  update-us-and-analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: Python 환경 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 구글 인증키 생성
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+
+      - name: 미국장 업데이트, 오전 스냅샷 및 AI 분석
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python batch_daily.py us
+
+
+============================================================
+📁 File Path: ./src/sheets_client.py
+============================================================
+import gspread
+from google.oauth2.service_account import Credentials
+import os
+
+def get_sheet_client():
+    """Google Sheets API 클라이언트를 인증하고 반환합니다."""
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    
+    # 루트 디렉토리의 credentials.json 경로 지정
+    creds_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'credentials.json')
+    
+    if not os.path.exists(creds_path):
+        raise FileNotFoundError("credentials.json 파일이 최상위 폴더에 없습니다!")
+        
+    credentials = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    client = gspread.authorize(credentials)
+    
+    return client
+
+# --- 테스트 실행 블록 ---
+if __name__ == "__main__":
+    try:
+        client = get_sheet_client()
+        print("✅ 구글 시트 API 인증 성공!")
+    except Exception as e:
+        print(f"❌ 인증 실패: {e}")
+
+============================================================
+📁 File Path: ./src/__init__.py
+============================================================
+
+
+============================================================
+📁 File Path: ./src/config.py
+============================================================
+
+
+============================================================
+📁 File Path: ./src/ai_agent.py
+============================================================
+import os
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+
+# 환경변수 로드
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# 최신 Gemini 클라이언트 초기화
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+def analyze_portfolio(portfolio_data: str, persona: str) -> str:
+    # 모든 페르소나에게 강제할 공통 마크다운 출력 포맷
+    format_rule = """
+    [출력 형식 제한]
+    반드시 아래의 마크다운 템플릿을 엄격하게 유지하여 작성하십시오. 불필요한 인사말이나 서론은 절대 생략합니다.
+    
+    **💡 핵심 요약:** (현재 상황을 1~2문장으로 예리하게 요약)
+    
+    **🔍 세부 분석:**
+    - (분석 포인트 1)
+    - (분석 포인트 2)
+    
+    **🎯 액션 플랜:** (매수/매도/홀드 또는 구체적인 리밸런싱 전략 제시)
+    """
+
+    prompts = {
+        "quant": (
+            "당신은 월스트리트 헤지펀드의 수석 퀀트(Quant) 애널리스트입니다. "
+            "주어진 포트폴리오 데이터를 바탕으로 변동성, 모멘텀, 리스크 관리(MDD 최소화) 관점에서 분석하세요. "
+            "구글 검색을 통해 현재 시장의 전반적인 VIX(공포지수)나 주요 기술적 지표 동향을 파악한 뒤 기계적이고 냉철한 전략을 제시하십시오."
+        ),
+        "macro": (
+            "당신은 글로벌 매크로 헤지펀드의 포트폴리오 매니저입니다. "
+            "구글 검색을 통해 가장 최근의 금리 동향, 연준(Fed)의 스탠스, 주요 경제 지표(CPI, 고용 등) 및 환율 뉴스를 확인하세요. "
+            "현재 거시 경제 환경에서 특정 섹터가 받을 영향을 탑다운(Top-down) 관점에서 분석하고 자산 배분 전략을 제시하십시오."
+        ),
+        "value": (
+            "당신은 잉여현금흐름(FCF)과 본질 가치를 중시하는 정통 딥밸류(Deep Value) 투자자입니다. "
+            "구글 검색으로 최근 실적 발표, 가이던스, 또는 펀더멘털 관련 뉴스를 파악하세요. "
+            "단기 가격 변동은 무시하고, 기업의 해자(Moat)와 안전마진(Margin of Safety) 관점에서 무겁고 진중하게 조언하십시오."
+        ),
+        "ten_bagger": (
+            "당신은 파괴적 혁신을 쫓는 실리콘밸리의 벤처캐피탈리스트이자 텐베거(10-Bagger) 발굴 전문가입니다. "
+            "구글 검색을 통해 핵심 기술 발전이 강력하게 밀어주는 유망 메가트렌드 섹터를 파악하세요. "
+            "기존 포트폴리오 분석에 더해 폭발적 성장이 기대되는 새로운 유망 기업 하나를 강렬하게 추천하십시오."
+        )
+    }
+    
+    system_instruction = prompts.get(persona, "당신은 전문적인 금융 AI 애널리스트입니다.") + "\n\n" + format_rule
+    
+    try:
+        response = client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=f"다음은 오늘 장 마감 후의 내 포트폴리오 데이터야:\n{portfolio_data}\n\n이 데이터와 최신 검색 결과를 바탕으로 너의 페르소나에 맞춰 심층 분석 리포트를 작성해줘.",
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.3, # 일관된 템플릿 출력을 위해 온도를 약간 낮춤
+                tools=[{"google_search": {}}], 
+            )
+        )
+        return response.text
+    except Exception as e:
+        print(f"[{persona}] AI 분석 중 오류 발생: {e}")
+        return "분석 결과를 불러오지 못했습니다."
+
+
+============================================================
+📁 File Path: ./src/market_data.py
+============================================================
+import FinanceDataReader as fdr
+import pandas as pd
+from datetime import datetime, timedelta
+import math
+
+def get_stock_info(ticker):
+    """
+    FinanceDataReader를 활용하여 한/미 주식의 현재가와 1일 변동률을 가져옵니다.
+    - 한국 주식: '005930' (숫자 6자리)
+    - 미국 주식: 'NVDA', 'AAPL' 등
+    """
+    try:
+        # 휴장일을 대비해 넉넉하게 최근 7일치 데이터를 요청
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+        
+        # 티커가 정수형으로 들어올 경우를 대비해 문자열로 변환 (예: 5930 -> '005930')
+        ticker_str = str(ticker).zfill(6) if str(ticker).isdigit() else str(ticker)
+        
+        df = fdr.DataReader(ticker_str, start_date, end_date)
+        
+        if df.empty or len(df) < 2:
+            print(f"⚠️ [{ticker_str}] 데이터를 충분히 불러오지 못했습니다.")
+            return None
+            
+        current_price = float(df['Close'].iloc[-1])
+        prev_price = float(df['Close'].iloc[-2])
+        
+        if math.isnan(current_price) or math.isnan(prev_price):
+            print(f"⚠️ [{ticker_str}] 결측치(NaN)가 감지되어 건너뜁니다.")
+            return None
+            
+        # 1일 수익률 계산 (%)
+        daily_return_pct = ((current_price - prev_price) / prev_price) * 100
+        
+        return {
+            "ticker": ticker_str,
+            "current_price": round(current_price, 2),
+            "1d_return": round(daily_return_pct, 2)
+        }
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}")
+        return None
+
+# --- 테스트 실행 블록 ---
+if __name__ == "__main__":
+    # 한국 주식(삼성전자)과 미국 주식(엔비디아) 동시 테스트
+    test_tickers = ["005930", "NVDA"] 
+    
+    for t in test_tickers:
+        data = get_stock_info(t)
+        if data:
+            print(f"[{data['ticker']}] 현재가: {data['current_price']} (1일 변동: {data['1d_return']}%)")
+
+
+============================================================
+📁 File Path: ./src/bot_handlers.py
+============================================================
+import os
+import json
+import re
+import datetime
+import asyncio
+from functools import wraps
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from src.sheets_client import get_sheet_client
+
+# 환경변수 로드
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# 허용된 사용자 ID 리스트 파싱
+ALLOWED_USER_IDS = [
+    int(uid.strip()) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()
+]
+
+DASHBOARD_URL = "https://finance-dashboard-mcgod.streamlit.app"
+
+def restricted(func):
+    """지정된 USER_ID만 봇을 사용할 수 있도록 막는 보안 데코레이터"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            if update.message:
+                await update.message.reply_text("⛔ [보안 차단] 허가되지 않은 사용자입니다.")
+            elif update.callback_query:
+                await update.callback_query.answer("⛔ 권한이 없습니다.", show_alert=True)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+def extract_json_from_text(text: str):
+    """AI 응답 텍스트에서 정규식을 이용해 순수 JSON 데이터만 안전하게 추출"""
+    cleaned = re.sub(r'```json\n|```', '', text).strip()
+    match = re.search(r'(\[.*\]|\{.*\})', cleaned, re.DOTALL)
+    if match:
+        return json.loads(match.group(1))
+    return json.loads(cleaned)
+
+@restricted
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_msg = (
+        "안녕하세요! 프라이빗 AI 투자 어시스턴트입니다.\n\n"
+        "👇 아래 버튼을 눌러 대시보드를 확인하거나 명령어를 입력해 보세요.\n"
+        "- /ai : 오늘의 4인방 AI 심층 분석 리포트 확인\n"
+        "📸 보유 주식 현황 스크린샷을 보내주시면 자동으로 판독하여 시트에 입력해 드립니다!"
+    )
+    keyboard = [[InlineKeyboardButton("📈 내 포트폴리오 대시보드 열기", url=DASHBOARD_URL)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(welcome_msg, reply_markup=reply_markup)
+
+@restricted
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 이미지를 분석하여 표준 코드로 변환 중입니다... (약 5~10초 소요)")
+    
+    try:
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        
+        prompt = """
+        첨부된 주식 보유 현황 스크린샷에서 종목 정보들을 정확하게 추출해줘.
+        
+        ⚠️ [필수 변환 규칙]
+        1. ticker: FinanceDataReader가 인식할 수 있는 표준 코드로 변환해야 해.
+           - 한국 주식: 반드시 6자리 숫자 종목코드 (예: 삼성전자는 "005930")
+           - 미국 주식: 반드시 영문 대문자 티커 기호 (예: Apple은 "AAPL")
+        2. currency: 해당 주식의 거래 통화를 판별해줘.
+           - 한국 주식 상장이면 "KRW"
+           - 미국 주식 상장이면 "USD"
+        3. shares: 보유 주식 수량 (숫자)
+        4. price: 평균 매입 단가 (숫자)
+        
+        출력은 반드시 다른 부가 설명 없이 오직 아래 스키마의 JSON 배열 형태로만 반환해줘.
+        [
+            {"ticker": "005930", "currency": "KRW", "shares": 50, "price": 72000},
+            {"ticker": "TSLA", "currency": "USD", "shares": 10, "price": 175.5}
+        ]
+        """
+        
+        response = ai_client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=[types.Part.from_bytes(data=bytes(photo_bytes), mime_type="image/jpeg"), prompt],
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        
+        parsed_stocks = extract_json_from_text(response.text)
+        
+        if not parsed_stocks:
+            await update.message.reply_text("❌ 이미지에서 주식 보유 정보를 찾지 못했습니다.")
+            return
+            
+        context.user_data['temp_ocr_data'] = parsed_stocks
+        
+        confirm_msg = "🔍 **[표준 코드 변환 판독 결과]**\n\n"
+        for idx, stock in enumerate(parsed_stocks, 1):
+            unit = "원" if stock['currency'] == "KRW" else "$"
+            confirm_msg += f"{idx}. **{stock['ticker']}** ({stock['currency']}) : {stock['shares']}주 (평단: {stock['price']:,}{unit})\n"
+            
+        confirm_msg += "\n위 데이터가 정확한가요? 저장할 계좌 종류를 선택하시면 구글 시트에 일괄 입력됩니다."
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("📁 일반 계좌에 저장", callback_data="save_ocr_일반"),
+                InlineKeyboardButton("🛡️ 연금 계좌에 저장", callback_data="save_ocr_연금")
+            ],
+            [InlineKeyboardButton("❌ 취소", callback_data="save_ocr_cancel")]
+        ]
+        await update.message.reply_text(confirm_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ 이미지 파싱 중 오류가 발생했습니다: {e}")
+
+@restricted
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if not data.startswith("save_ocr_"):
+        return
+        
+    action = data.replace("save_ocr_", "")
+    
+    if action == "cancel":
+        context.user_data.pop('temp_ocr_data', None)
+        await query.edit_message_text("❌ 입력 작업이 취소되었습니다.")
+        return
+        
+    stocks = context.user_data.get('temp_ocr_data')
+    if not stocks:
+        await query.edit_message_text("❌ 저장할 데이터가 존재하지 않습니다.")
+        return
+    
+    try:
+        await query.edit_message_text(f"📥 구글 시트({action} 계좌)에 표준 데이터 기록 중...")
+        
+        today_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        sheet_client = get_sheet_client()
+        doc = sheet_client.open_by_key(SPREADSHEET_ID)
+        tx_sheet = doc.worksheet("Transaction")
+        
+        for stock in stocks:
+            new_row = [
+                today_date, 
+                "매수", 
+                stock["ticker"], 
+                stock.get("shares", 0), 
+                stock.get("price", 0), 
+                action,                        
+                stock.get("currency", "KRW")   
+            ]
+            tx_sheet.append_row(new_row)
+            
+        context.user_data.pop('temp_ocr_data', None)
+        await query.edit_message_text(f"✅ 성공적으로 총 {len(stocks)}개의 종목이 정상 규격으로 **[{action} 계좌]**에 반영되었습니다!")
+        
+    except Exception as e:
+        await query.edit_message_text(f"❌ 구글 시트 저장 중 예외 발생: {e}")
+
+@restricted
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    await update.message.reply_text("🤖 입력하신 내용을 분석 중입니다...")
+    
+    prompt = f"""
+    사용자의 입력을 분석하여 의도(intent)를 파악하고, 결과를 오직 JSON 형식으로만 반환해.
+    ⚠️ [필수 변환 규칙]
+    1. ticker: 한국 주식은 6자리 숫자 코드, 미국 주식은 영문 대문자 티커로 변환해.
+    2. currency: 한국 주식이면 "KRW", 미국 주식이면 "USD"로 판별해.
+    
+    입력: "{user_text}"
+    
+    JSON 스키마:
+    {{
+        "intent": "view_portfolio" OR "record_transaction" OR "unknown",
+        "action": "매수" 또는 "매도",
+        "ticker": "표준 주식 티커/코드",
+        "currency": "KRW" OR "USD",
+        "shares": 수량 (숫자),
+        "price": 단가 (숫자)
+    }}
+    """
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        data = extract_json_from_text(response.text)
+        intent = data.get("intent", "unknown")
+        
+        if intent == "view_portfolio":
+            await send_portfolio_status(update)
+        elif intent == "record_transaction":
+            if not data.get("ticker") or not data.get("action"):
+                 await update.message.reply_text("매매 기록으로 인식되었으나 핵심 정보가 누락되었습니다.")
+                 return
+            today_date = datetime.datetime.now().strftime("%Y-%m-%d")
+            sheet_client = get_sheet_client()
+            doc = sheet_client.open_by_key(SPREADSHEET_ID)
+            tx_sheet = doc.worksheet("Transaction")
+            
+            new_row = [
+                today_date, 
+                data["action"], 
+                data["ticker"], 
+                data.get("shares", 0), 
+                data.get("price", 0), 
+                "일반",                         
+                data.get("currency", "KRW")   
+            ]
+            tx_sheet.append_row(new_row)
+            unit = "원" if data.get("currency") == "KRW" else "$"
+            await update.message.reply_text(f"✅ 구글 시트 기록 완료!\n[{data['action']}] {data['ticker']} {data.get('shares')}주 (단가: {data.get('price'):,}{unit})")
+        else:
+            await update.message.reply_text("무슨 말씀인지 잘 모르겠어요. 다시 말씀해주세요!")
+    except Exception as e:
+        await update.message.reply_text(f"처리 중 오류가 발생했습니다: {e}")
+
+@restricted
+async def ai_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("데이터를 불러오는 중입니다... 🔄")
+    try:
+        sheet_client = get_sheet_client()
+        doc = sheet_client.open_by_key(SPREADSHEET_ID)
+        ai_records = doc.worksheet("AI_Reports").get_all_records()
+        if not ai_records:
+            await update.message.reply_text("아직 작성된 AI 리포트가 없습니다.")
+            return
+        latest = ai_records[-1] 
+        await update.message.reply_text(f"📅 분석 일자: {latest.get('Date', 'N/A')}\n\n🤖 4인방 AI 심층 분석 리포트를 순차적으로 전송합니다.")
+        await asyncio.sleep(0.5) 
+        for key, name in [('Quant_Opinion', '📉 [퀀트 의견]'), ('Macro_Opinion', '🌍 [매크로 의견]'), ('Value_Opinion', '💎 [가치투자 의견]'), ('Ten_Bagger_Opinion', '🚀 [텐베거 의견]')]:
+            if latest.get(key):
+                await update.message.reply_text(f"{name}\n{latest.get(key)}")
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        await update.message.reply_text(f"오류가 발생했습니다: {e}")
+
+async def send_portfolio_status(update: Update):
+    try:
+        sheet_client = get_sheet_client()
+        doc = sheet_client.open_by_key(SPREADSHEET_ID)
+        portfolio_records = doc.worksheet("Portfolio").get_all_records()
+        if not portfolio_records:
+            await update.message.reply_text("현재 포트폴리오에 등록된 종목이 없습니다.")
+            return
+        msg = "📊 **[현재 자산 현황 요약]**\n\n"
+        for row in portfolio_records:
+            ticker = row.get("Ticker")
+            if ticker:
+                shares = row.get("Shares", 0)
+                c_price = row.get("Current_Price", 0)
+                d_return = row.get("1D_Return", 0)
+                account_type = row.get("Account", "일반")
+                currency = row.get("Currency", "USD" if str(ticker).isalpha() else "KRW")
+                unit = "원" if currency == "KRW" else "$"
+                try:
+                    val = float(str(d_return).replace("%", "").strip())
+                    icon = "🔴" if val > 0 else "🔵" if val < 0 else "⚪"
+                except ValueError:
+                    icon = "⚪"
+                msg += f"▪️ **{ticker}** ({account_type} / {currency}) : {shares}주\n   (현재가: {c_price:,}{unit} / 1D: {icon} {d_return}%)\n\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"포트폴리오 조회 중 오류가 발생했습니다: {e}")
+
+

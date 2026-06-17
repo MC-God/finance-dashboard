@@ -3,6 +3,7 @@ import json
 import re
 import datetime
 import asyncio
+import gspread
 from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -68,7 +69,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         prompt = """
         첨부된 주식 보유 현황 스크린샷에서 종목 정보들을 정확하게 추출해줘.
-        
         ⚠️ [필수 변환 규칙]
         1. ticker: FinanceDataReader가 인식할 수 있는 표준 코드로 변환해야 해.
            - 한국 주식: 반드시 6자리 숫자 종목코드 (예: 삼성전자는 "005930")
@@ -155,7 +155,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 stock["ticker"], 
                 stock.get("shares", 0), 
                 stock.get("price", 0), 
-                action,                        
+                action,    
                 stock.get("currency", "KRW")   
             ]
             tx_sheet.append_row(new_row)
@@ -200,27 +200,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if intent == "view_portfolio":
             await send_portfolio_status(update)
+            
         elif intent == "record_transaction":
             if not data.get("ticker") or not data.get("action"):
                  await update.message.reply_text("매매 기록으로 인식되었으나 핵심 정보가 누락되었습니다.")
                  return
+                 
             today_date = datetime.datetime.now().strftime("%Y-%m-%d")
             sheet_client = get_sheet_client()
             doc = sheet_client.open_by_key(SPREADSHEET_ID)
-            tx_sheet = doc.worksheet("Transaction")
             
-            new_row = [
-                today_date, 
-                data["action"], 
-                data["ticker"], 
-                data.get("shares", 0), 
-                data.get("price", 0), 
-                "일반",                         
-                data.get("currency", "KRW")   
-            ]
-            tx_sheet.append_row(new_row)
-            unit = "원" if data.get("currency") == "KRW" else "$"
-            await update.message.reply_text(f"✅ 구글 시트 기록 완료!\n[{data['action']}] {data['ticker']} {data.get('shares')}주 (단가: {data.get('price'):,}{unit})")
+            action_type = data["action"]
+            ticker = data["ticker"]
+            shares = data.get("shares", 0)
+            price = data.get("price", 0)
+            currency = data.get("currency", "KRW")
+            account_type = "일반" # 기본값 처리
+            unit = "원" if currency == "KRW" else "$"
+            
+            # 1. Transaction 시트에 기본 기록
+            tx_sheet = doc.worksheet("Transaction")
+            tx_sheet.append_row([today_date, action_type, ticker, shares, price, account_type, currency])
+            
+            reply_text = f"✅ 구글 시트 거래 기록 완료!\n[{action_type}] {ticker} {shares}주 (단가: {price:,}{unit})"
+            
+            # 2. 매도일 경우 Realized_PnL (실현 손익) 계산 및 기록
+            if action_type in ["매도", "sell"]:
+                try:
+                    port_records = doc.worksheet("Portfolio").get_all_records()
+                    avg_price = 0
+                    
+                    # Portfolio 시트에서 해당 티커의 Avg_Price 찾기
+                    for row in port_records:
+                        row_ticker = str(row.get("Ticker", "")).replace("'", "").strip()
+                        if row_ticker == ticker or row_ticker.zfill(6) == ticker:
+                            avg_price = float(str(row.get("Avg_Price", "0")).replace(",", ""))
+                            break
+                            
+                    if avg_price > 0:
+                        realized_pnl = (price - avg_price) * shares
+                        
+                        try:
+                            pnl_sheet = doc.worksheet("Realized_PnL")
+                        except gspread.exceptions.WorksheetNotFound:
+                            # 만약 migrate_db.py를 아직 안 돌렸다면 자동 생성
+                            pnl_sheet = doc.add_worksheet(title="Realized_PnL", rows="1000", cols="10")
+                            pnl_sheet.append_row(["Date", "Ticker", "Account", "Currency", "Sold_Shares", "Sell_Price", "Avg_Cost", "Realized_PnL"])
+                        
+                        # Realized_PnL 시트에 기록
+                        pnl_sheet.append_row([today_date, ticker, account_type, currency, shares, price, avg_price, realized_pnl])
+                        
+                        profit_sign = "+" if realized_pnl > 0 else ""
+                        reply_text += f"\n💰 **실현 손익 계산 완료:** {profit_sign}{realized_pnl:,.2f} {unit} (평단가: {avg_price:,.2f} {unit} 기준)"
+                    else:
+                        reply_text += "\n⚠️ 포트폴리오에서 해당 종목의 매수 평단가를 찾지 못해 실현 손익은 기록되지 않았습니다."
+                        
+                except Exception as ex:
+                    print(f"PnL 처리 중 오류: {ex}")
+            
+            await update.message.reply_text(reply_text, parse_mode="Markdown")
+            
         else:
             await update.message.reply_text("무슨 말씀인지 잘 모르겠어요. 다시 말씀해주세요!")
     except Exception as e:
