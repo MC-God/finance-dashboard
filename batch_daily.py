@@ -66,7 +66,8 @@ def run_daily_batch(mode="all"):
     holdings = {}
     for row in tx_records:
         row_clean = {str(k).strip().lower(): v for k, v in row.items()}
-        ticker = str(row_clean.get('ticker', '')).strip()
+        # [핵심 방어 1] Transaction 시트에서 티커를 읽을 때도 혹시 모를 따옴표를 모두 제거
+        ticker = str(row_clean.get('ticker', '')).replace("'", "").strip()
         action = str(row_clean.get('type', '')).strip()
         if not ticker: continue
         if ticker.isdigit(): ticker = ticker.zfill(6)
@@ -94,7 +95,8 @@ def run_daily_batch(mode="all"):
     port_sheet = doc.worksheet("Portfolio")
     old_prices = {}
     for r in port_sheet.get_all_records():
-        t = str(r.get("Ticker", "")).strip()
+        # [핵심 방어 2] Portfolio 시트에서 이전 가격을 읽을 때 따옴표를 완벽하게 제거하여 순수 매칭
+        t = str(r.get("Ticker", "")).replace("'", "").strip()
         if t.isdigit(): t = t.zfill(6)
         old_prices[t] = (r.get("Current_Price", 0), r.get("1D_Return", "0.00%"), str(r.get("Stock_Name", t)))
 
@@ -109,12 +111,12 @@ def run_daily_batch(mode="all"):
 
         avg_price = data['total_cost'] / shares
         
-        # [핵심] 영문 섞인 ETF나 KRW 종목 모두 완벽하게 한국 주식으로 인식
         is_kr = ticker.isdigit() or currency == 'KRW' or (any(c.isdigit() for c in ticker) and len(ticker) == 6)
         
         current_price = avg_price
         one_day_return = "0.00%"
         
+        # 따옴표가 제거된 순수 티커로 완벽 매칭 수행 (매수가로 덮어씌워지는 현상 차단)
         if ticker in old_prices:
             current_price, one_day_return, stock_name = old_prices[ticker]
         else:
@@ -129,7 +131,6 @@ def run_daily_batch(mode="all"):
             try:
                 df_stock = pd.DataFrame()
                 if is_kr:
-                    # 네이버 금융 모바일 API 직결로 한국 전 종목 0.1초 만에 100% 호출
                     try:
                         url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{ticker}"
                         res = requests.get(url, timeout=5).json()
@@ -153,6 +154,8 @@ def run_daily_batch(mode="all"):
                 print(f"⚠️ [{ticker}] 시세 연동 실패: {e}")
 
         total_value_krw = shares * current_price * usd_krw if currency == 'USD' else shares * current_price
+        
+        # 다시 구글 시트에 안전하게 쓸 때는 보호막 생성
         safe_ticker = f"'{ticker}" if is_kr else ticker
         
         portfolio_rows.append([safe_ticker, stock_name, shares, round(avg_price, 2), current_price, one_day_return, currency, account])
