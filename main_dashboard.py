@@ -62,7 +62,6 @@ def load_data():
             
     return fetch_sheet("Portfolio"), fetch_sheet("History"), (doc.worksheet("AI_Reports").get_all_records()[-1] if doc.worksheet("AI_Reports").get_all_records() else None)
 
-# [복구 완료] 콤마나 통화 기호를 지우고 숫자로 바꿔주는 필수 공용 함수
 def clean_numeric(series):
     cleaned = series.astype(str).str.replace(r'[^\d\.-]', '', regex=True)
     return pd.to_numeric(cleaned, errors='coerce').fillna(0)
@@ -72,29 +71,24 @@ def parse_exact_date(date_series):
     s = s.apply(lambda x: x + " 18:00:00" if len(x) == 10 else x)
     return pd.to_datetime(s, errors='coerce')
 
-# History 데이터 중앙 세탁기 (날짜 보정 + 따옴표 제거 + 중복 스파이크 킬러)
 def clean_history_data(df_raw):
     if df_raw.empty or 'Date' not in df_raw.columns:
         return pd.DataFrame()
         
     df = df_raw.copy()
     
-    # 1. 날짜 시간 규격화 (시간 없으면 18:00:00 강제 부여)
     df['ExactDate'] = parse_exact_date(df['Date'])
     df = df.dropna(subset=['ExactDate'])
     
-    # 2. 티커 따옴표 벗기기 ('229200 -> 229200)
     if 'Ticker' in df.columns:
         df['Ticker'] = df['Ticker'].astype(str).str.replace("'", "", regex=False).str.strip()
         
-    # 3. 자산 가치 숫자화
     if 'Total_Value_KRW' in df.columns:
         df['Total_Value_KRW'] = clean_numeric(df['Total_Value_KRW'])
         
     if 'Account' in df.columns:
         df['Account'] = df['Account'].astype(str).str.strip()
         
-    # 4. 강력한 중복 제거 (스파이크 뻥튀기 원천 차단)
     if 'Ticker' in df.columns and 'Account' in df.columns:
         df = df.drop_duplicates(subset=['ExactDate', 'Ticker', 'Account'], keep='last')
         
@@ -206,7 +200,6 @@ try:
     with st.spinner("데이터 동기화 및 ML 섹터 분류 중..."):
         df_port_raw, df_hist_raw, latest_ai_report = load_data()
 
-    # 중앙 세탁기를 통과시킨 무결점 History 데이터 생성
     df_hist_clean = clean_history_data(df_hist_raw)
 
     total_diff, total_pct = calc_delta(df_hist_clean)
@@ -278,41 +271,49 @@ try:
     with col3: st.markdown(render_card("🛡️ 연금저축/IRP 자산", pension_asset, pension_diff, pension_pct, "원"), unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    g1, g2 = st.columns([5, 5])
-    with g1:
-        st.subheader("📈 자산 성장 타임라인")
-        if not df_hist_clean.empty:
-            df_timeline = df_hist_clean.groupby(['ExactDate', 'Account'])['Total_Value_KRW'].sum().reset_index()
-            df_total = df_timeline.groupby('ExactDate')['Total_Value_KRW'].sum().reset_index()
-            df_total['Account'] = '총 자산'
-            df_timeline = pd.concat([df_timeline, df_total], ignore_index=True)
-            
-            fig_line = px.line(
-                df_timeline, x='ExactDate', y='Total_Value_KRW', color='Account',
-                markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
-            )
-            fig_line.update_layout(
-                margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
-                xaxis_title=None, yaxis_title=None, legend_title=None,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            st.plotly_chart(fig_line, use_container_width=True)
-        else: st.info("📅 아직 데이터 축적량이 부족합니다.")
+    # --- 여기서부터 1열 2행(상하 레이아웃)으로 변경된 부분입니다 ---
 
-    with g2:
-        st.subheader("🍕 ML 기반 섹터별 심층 비중 (Treemap)")
-        if not df_port.empty:
-            df_port['Root'] = '전체 포트폴리오'
-            fig = px.treemap(
-                df_port, 
-                path=['Root', 'Sector', 'Stock_Name'], 
-                values='Total_Value_KRW',
-                color='ROI',
-                color_continuous_scale=['#1C83E1', '#2e3440', '#FF4B4B'],
-                color_continuous_midpoint=0
-            )
-            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-            st.plotly_chart(fig, use_container_width=True)
+    # 1. 상단: 자산 성장 타임라인 (넓고 시원하게)
+    st.subheader("📈 자산 성장 타임라인")
+    if not df_hist_clean.empty:
+        df_timeline = df_hist_clean.groupby(['ExactDate', 'Account'])['Total_Value_KRW'].sum().reset_index()
+        df_total = df_timeline.groupby('ExactDate')['Total_Value_KRW'].sum().reset_index()
+        df_total['Account'] = '총 자산'
+        df_timeline = pd.concat([df_timeline, df_total], ignore_index=True)
+        
+        fig_line = px.line(
+            df_timeline, x='ExactDate', y='Total_Value_KRW', color='Account',
+            markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
+        )
+        fig_line.update_layout(
+            height=450, # 세로 길이를 늘려 가시성 확보
+            margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+            xaxis_title=None, yaxis_title=None, legend_title=None,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_line, use_container_width=True)
+    else: 
+        st.info("📅 아직 데이터 축적량이 부족합니다.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # 2. 하단: 섹터별 심층 비중 트리맵 (넓은 화면을 활용해 텍스트 가독성 극대화)
+    st.subheader("🍕 ML 기반 섹터별 심층 비중 (Treemap)")
+    if not df_port.empty:
+        df_port['Root'] = '전체 포트폴리오'
+        fig_tree = px.treemap(
+            df_port, 
+            path=['Root', 'Sector', 'Stock_Name'], 
+            values='Total_Value_KRW',
+            color='ROI',
+            color_continuous_scale=['#1C83E1', '#2e3440', '#FF4B4B'],
+            color_continuous_midpoint=0
+        )
+        fig_tree.update_layout(
+            height=550, # 트리맵도 화면 전체 너비를 쓰도록 높이 상향 조정
+            margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)'
+        )
+        st.plotly_chart(fig_tree, use_container_width=True)
 
     st.markdown("---")
 
