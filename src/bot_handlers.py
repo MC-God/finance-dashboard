@@ -94,6 +94,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         parsed_stocks = extract_json_from_text(response.text)
         
+        # [방어 로직] AI가 리스트가 아닌 단일 딕셔너리로 반환했을 경우를 대비
+        if isinstance(parsed_stocks, dict):
+            parsed_stocks = [parsed_stocks]
+        
         if not parsed_stocks:
             await update.message.reply_text("❌ 이미지에서 주식 보유 정보를 찾지 못했습니다.")
             return
@@ -195,7 +199,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
+        
         data = extract_json_from_text(response.text)
+        
+        # [방어 로직] AI가 JSON 객체가 아닌 JSON 배열 [ {...} ] 형태로 반환했을 경우 처리
+        if isinstance(data, list):
+            data = data[0] if data else {}
+            
         intent = data.get("intent", "unknown")
         
         if intent == "view_portfolio":
