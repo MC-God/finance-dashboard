@@ -11,6 +11,8 @@ from src.ai_agent import analyze_portfolio
 
 load_dotenv()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ALLOWED_USER_IDS = [int(uid.strip()) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()]
 
 US_STOCK_NAME_REGISTRY = {
     '0013P0': 'RISE 미국은행TOP10', 
@@ -39,6 +41,19 @@ def get_usd_krw_rate():
 def get_kst_now():
     return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)
 
+def send_telegram_push(message: str):
+    """배치 작업 완료 후 텔레그램으로 푸시 메시지를 발송하는 함수"""
+    if not TELEGRAM_TOKEN or not ALLOWED_USER_IDS:
+        print("⚠️ 텔레그램 푸시 알림 설정이 누락되어 발송을 건너뜁니다.")
+        return
+    for user_id in ALLOWED_USER_IDS:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": user_id, "text": message, "parse_mode": "Markdown"}
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            print(f"⚠️ 사용자 {user_id}에게 텔레그램 푸시 실패: {e}")
+
 def run_daily_batch(mode="all"):
     kst_now = get_kst_now()
     snapshot_time = "06:00:00" if kst_now.hour < 12 else "18:00:00"
@@ -66,7 +81,6 @@ def run_daily_batch(mode="all"):
     holdings = {}
     for row in tx_records:
         row_clean = {str(k).strip().lower(): v for k, v in row.items()}
-        # [핵심 방어 1] Transaction 시트에서 티커를 읽을 때도 혹시 모를 따옴표를 모두 제거
         ticker = str(row_clean.get('ticker', '')).replace("'", "").strip()
         action = str(row_clean.get('type', '')).strip()
         if not ticker: continue
@@ -95,7 +109,6 @@ def run_daily_batch(mode="all"):
     port_sheet = doc.worksheet("Portfolio")
     old_prices = {}
     for r in port_sheet.get_all_records():
-        # [핵심 방어 2] Portfolio 시트에서 이전 가격을 읽을 때 따옴표를 완벽하게 제거하여 순수 매칭
         t = str(r.get("Ticker", "")).replace("'", "").strip()
         if t.isdigit(): t = t.zfill(6)
         old_prices[t] = (r.get("Current_Price", 0), r.get("1D_Return", "0.00%"), str(r.get("Stock_Name", t)))
@@ -116,7 +129,6 @@ def run_daily_batch(mode="all"):
         current_price = avg_price
         one_day_return = "0.00%"
         
-        # 따옴표가 제거된 순수 티커로 완벽 매칭 수행 (매수가로 덮어씌워지는 현상 차단)
         if ticker in old_prices:
             current_price, one_day_return, stock_name = old_prices[ticker]
         else:
@@ -142,6 +154,7 @@ def run_daily_batch(mode="all"):
                     except: pass
                 else: 
                     df_stock = yf.Ticker(ticker).history(period="7d")
+                
                     if not df_stock.empty:
                         df_stock = df_stock.dropna(subset=['Close'])
                         if len(df_stock) >= 1:
@@ -155,7 +168,6 @@ def run_daily_batch(mode="all"):
 
         total_value_krw = shares * current_price * usd_krw if currency == 'USD' else shares * current_price
         
-        # 다시 구글 시트에 안전하게 쓸 때는 보호막 생성
         safe_ticker = f"'{ticker}" if is_kr else ticker
         
         portfolio_rows.append([safe_ticker, stock_name, shares, round(avg_price, 2), current_price, one_day_return, currency, account])
@@ -206,6 +218,10 @@ def run_daily_batch(mode="all"):
             ai_reports_sheet = doc.worksheet("AI_Reports")
             ai_reports_sheet.append_row([snapshot_date_str, ai_results["quant"], ai_results["macro"], ai_results["value"], ai_results["ten_bagger"]])
             print("🎉 AI 분석 리포트 저장 완료!")
+            
+            # --- 푸시 알림 발송 로직 추가 ---
+            push_msg = f"🔔 **포트폴리오 동기화 & AI 분석 완료!**\n\n기준: {snapshot_date_str}\n\n오늘 장 스냅샷 갱신 및 4인의 AI 리포트가 완성되었습니다. 대시보드를 확인하시거나 `/ai` 명령어를 입력해 보세요!"
+            send_telegram_push(push_msg)
 
 if __name__ == "__main__":
     run_mode = "all"
