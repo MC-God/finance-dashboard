@@ -76,7 +76,6 @@ def clean_history_data(df_raw):
         return pd.DataFrame()
         
     df = df_raw.copy()
-    
     df['ExactDate'] = parse_exact_date(df['Date'])
     df = df.dropna(subset=['ExactDate'])
     
@@ -172,7 +171,7 @@ def get_smart_sectors(portfolio_dicts):
                 elif 'Biotech' in ind or 'Health' in sec: sector_map[t] = '바이오/헬스케어'
                 elif sec:
                     sector_map[t] = YF_SECTOR_MAP.get(sec, sec)
-                    continue
+                continue
             except: pass
             
         if t not in sector_map:
@@ -271,9 +270,6 @@ try:
     with col3: st.markdown(render_card("🛡️ 연금저축/IRP 자산", pension_asset, pension_diff, pension_pct, "원"), unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # --- 여기서부터 1열 2행(상하 레이아웃)으로 변경된 부분입니다 ---
-
-    # 1. 상단: 자산 성장 타임라인 (넓고 시원하게)
     st.subheader("📈 자산 성장 타임라인")
     if not df_hist_clean.empty:
         df_timeline = df_hist_clean.groupby(['ExactDate', 'Account'])['Total_Value_KRW'].sum().reset_index()
@@ -286,7 +282,7 @@ try:
             markers=True, color_discrete_map={'총 자산': '#FF4B4B', '일반': '#1C83E1', '연금': '#FBC02D'}
         )
         fig_line.update_layout(
-            height=450, # 세로 길이를 늘려 가시성 확보
+            height=450,
             margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
             xaxis_title=None, yaxis_title=None, legend_title=None,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
@@ -297,7 +293,6 @@ try:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # 2. 하단: 섹터별 심층 비중 트리맵 (넓은 화면을 활용해 텍스트 가독성 극대화)
     st.subheader("🍕 ML 기반 섹터별 심층 비중 (Treemap)")
     if not df_port.empty:
         df_port['Root'] = '전체 포트폴리오'
@@ -307,10 +302,11 @@ try:
             values='Total_Value_KRW',
             color='ROI',
             color_continuous_scale=['#1C83E1', '#2e3440', '#FF4B4B'],
-            color_continuous_midpoint=0
+            color_continuous_midpoint=0,
+            range_color=[-30, 30]  # 핵심 수정: 컬러 스케일 한계치를 -30% ~ +30%로 강제 고정
         )
         fig_tree.update_layout(
-            height=550, # 트리맵도 화면 전체 너비를 쓰도록 높이 상향 조정
+            height=550,
             margin=dict(t=10, b=10, l=10, r=10), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)'
         )
         st.plotly_chart(fig_tree, use_container_width=True)
