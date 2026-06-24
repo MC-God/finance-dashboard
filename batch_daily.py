@@ -88,7 +88,15 @@ def run_daily_batch(mode="all"):
             else: holdings[key]['shares'] -= shares
 
     port_sheet = doc.worksheet("Portfolio")
-    old_prices = {str(r.get("Ticker", "")).replace("'", "").strip(): (r.get("Current_Price", 0), r.get("1D_Return", "0.00%"), str(r.get("Stock_Name", ""))) for r in port_sheet.get_all_records()}
+    old_prices = {}
+    for r in port_sheet.get_all_records():
+        t = str(r.get("Ticker", "")).replace("'", "").strip()
+        if t.isdigit(): t = t.zfill(6)
+        # 구글 시트에서 가져온 가격에 콤마나 텍스트가 섞여있어도 안전하게 숫자로 변환하는 방어 로직
+        raw_price = str(r.get("Current_Price", "0")).replace(',', '').replace('$', '').replace('원', '').strip()
+        try: c_price = float(raw_price)
+        except: c_price = 0.0
+        old_prices[t] = (c_price, str(r.get("1D_Return", "0.00%")), str(r.get("Stock_Name", t)))
 
     portfolio_rows, history_rows, portfolio_text_list = [], [], []
 
@@ -99,22 +107,35 @@ def run_daily_batch(mode="all"):
         avg_price = data['total_cost'] / shares
         is_kr = ticker.isdigit() or currency == 'KRW' or (any(c.isdigit() for c in ticker) and len(ticker) == 6)
         
-        current_price, one_day_return = avg_price, "0.00%"
-        stock_name = old_prices[ticker][2] if ticker in old_prices else (krx_name_registry.get(ticker, ticker) if is_kr else US_STOCK_NAME_REGISTRY.get(ticker.upper(), ticker.upper()))
+        # 1. 기본값 세팅 (포트폴리오에 처음 들어온 신규 종목일 경우 매수가를 임시 현재가로 사용)
+        current_price = avg_price
+        one_day_return = "0.00%"
+        stock_name = krx_name_registry.get(ticker, ticker) if is_kr else US_STOCK_NAME_REGISTRY.get(ticker.upper(), ticker.upper())
 
+        # 2. [핵심 버그 수정] 기존 포트폴리오에 있던 종목이면, 무조건 어제 종가(기존 현재가)를 먼저 계승!
+        if ticker in old_prices:
+            current_price = old_prices[ticker][0]
+            one_day_return = old_prices[ticker][1]
+            stock_name = old_prices[ticker][2]
+
+        # 3. 해당 장(Market) 배치일 때만 API를 찔러서 최신화 (한국장 배치일 땐 한국 종목만, 미국장일 땐 미국 종목만 덮어씀)
         if (mode == "kr" and is_kr) or (mode == "us" and not is_kr) or mode == "all":
             print(f"[{ticker}] 최신 시세 동기화 중...")
             try:
                 if is_kr:
                     res = requests.get(f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{ticker}", timeout=5).json()
                     item = res['result']['areas'][0]['datas'][0]
-                    current_price, one_day_return = float(item['nv']), f"{float(item['cr']):+.2f}%"
+                    current_price = float(item['nv'])
+                    one_day_return = f"{float(item['cr']):+.2f}%"
                 else: 
                     df_stock = yf.Ticker(ticker).history(period="7d").dropna(subset=['Close'])
                     if not df_stock.empty:
                         current_price = float(df_stock['Close'].iloc[-1])
-                        if len(df_stock) >= 2: one_day_return = f"{((current_price - float(df_stock['Close'].iloc[-2])) / float(df_stock['Close'].iloc[-2]) * 100):+.2f}%"
-            except: pass
+                        if len(df_stock) >= 2: 
+                            prev_close = float(df_stock['Close'].iloc[-2])
+                            one_day_return = f"{((current_price - prev_close) / prev_close * 100):+.2f}%"
+            except Exception as e:
+                print(f"⚠️ [{ticker}] 시세 연동 실패: {e}")
 
         total_value_krw = shares * current_price * (usd_krw if currency == 'USD' else 1)
         safe_ticker = f"'{ticker}" if is_kr else ticker
@@ -132,19 +153,18 @@ def run_daily_batch(mode="all"):
     if not hist_sheet.get_all_values(): hist_sheet.append_row(["Date", "Ticker", "Stock_Name", "Total_Value_KRW", "Account"])
     if history_rows: hist_sheet.append_rows(history_rows)
 
+    # 4. AI 리포트는 하루의 모든 장이 끝나는 시점(미국장 마감 = "us" 모드)에 한 번만 실행됨
     if mode in ["us", "all"]:
         portfolio_data_str = "\n".join(portfolio_text_list)
         if portfolio_data_str.strip():
             print("🚀 [AI 분석] 리포트 생성 및 텔레그램 푸시 중...")
             ai_results = {}
-            # 1. 안내 메시지 먼저 발송
             send_telegram_push(f"🔔 **오늘의 포트폴리오 AI 분석 완료! ({snapshot_date_str})**\n\n4인 4색 전문가 리포트를 차례로 전송합니다.")
             
             for p, name in [("quant", "📉 퀀트"), ("macro", "🌍 매크로"), ("value", "💎 가치투자"), ("ten_bagger", "🚀 텐베거")]:
                 ai_results[p] = analyze_portfolio(portfolio_data_str, p)
-                # 2. 분석 완료된 페르소나별로 즉시 텔레그램 원문 발송
                 send_telegram_push(f"**[{name} 의견]**\n\n{ai_results[p]}")
-                time.sleep(1) # 메시지 순서 꼬임 방지
+                time.sleep(1)
             
             doc.worksheet("AI_Reports").append_row([snapshot_date_str, ai_results["quant"], ai_results["macro"], ai_results["value"], ai_results["ten_bagger"]])
             print("🎉 AI 분석 리포트 저장 완료!")
