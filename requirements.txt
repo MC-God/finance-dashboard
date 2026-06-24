@@ -7,3 +7,4 @@ streamlit
 python-telegram-bot
 yfinance
 pandas-datareader
+python-telegram-bot[job-queue]
