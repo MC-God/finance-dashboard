@@ -31,4 +31,7 @@ jobs:
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # 👇 텔레그램 푸시 알림을 위해 새로 추가된 부분 👇
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
         run: python batch_daily.py kr

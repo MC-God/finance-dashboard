@@ -44,6 +44,44 @@ def send_telegram_push(message: str):
         try: requests.post(url, json={"chat_id": user_id, "text": message}, timeout=5)
         except: pass
 
+def fetch_safely_latest_price(ticker, is_kr):
+    """
+    실시간 API가 실패하더라도 최근 14일 내의 가장 가까운 종가(Close)를 기어코 찾아내는 안전장치 함수
+    """
+    try:
+        if is_kr:
+            # 1. 한국장 시도 1: 네이버 실시간 폴링 API
+            try:
+                res = requests.get(f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{ticker}", timeout=3).json()
+                item = res['result']['areas'][0]['datas'][0]
+                return float(item['nv']), f"{float(item['cr']):+.2f}%"
+            except: pass
+            
+            # 2. 한국장 시도 2 (안전장치): FinanceDataReader로 최근 14일치 중 마지막 종가 가져오기
+            try:
+                start_date = (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
+                df = fdr.DataReader(ticker, start_date)
+                if not df.empty:
+                    c_price = float(df['Close'].iloc[-1])
+                    d_ret = f"{((c_price - float(df['Close'].iloc[-2])) / float(df['Close'].iloc[-2]) * 100):+.2f}%" if len(df) >= 2 else "0.00%"
+                    return c_price, d_ret
+            except: pass
+            
+        else:
+            # 3. 미국장 (안전장치 포함): yfinance로 최근 14일치를 불러와 가장 마지막 데이터 확보
+            try:
+                df_stock = yf.Ticker(ticker).history(period="14d").dropna(subset=['Close'])
+                if not df_stock.empty:
+                    c_price = float(df_stock['Close'].iloc[-1])
+                    d_ret = f"{((c_price - float(df_stock['Close'].iloc[-2])) / float(df_stock['Close'].iloc[-2]) * 100):+.2f}%" if len(df_stock) >= 2 else "0.00%"
+                    return c_price, d_ret
+            except: pass
+            
+    except Exception as e:
+        print(f"⚠️ [{ticker}] 완벽한 가격 조회 실패: {e}")
+        
+    return None, None
+
 def run_daily_batch(mode="all"):
     kst_now = get_kst_now()
     snapshot_time = "06:00:00" if kst_now.hour < 12 else "18:00:00"
@@ -92,7 +130,6 @@ def run_daily_batch(mode="all"):
     for r in port_sheet.get_all_records():
         t = str(r.get("Ticker", "")).replace("'", "").strip()
         if t.isdigit(): t = t.zfill(6)
-        # 구글 시트에서 가져온 가격에 콤마나 텍스트가 섞여있어도 안전하게 숫자로 변환하는 방어 로직
         raw_price = str(r.get("Current_Price", "0")).replace(',', '').replace('$', '').replace('원', '').strip()
         try: c_price = float(raw_price)
         except: c_price = 0.0
@@ -107,35 +144,28 @@ def run_daily_batch(mode="all"):
         avg_price = data['total_cost'] / shares
         is_kr = ticker.isdigit() or currency == 'KRW' or (any(c.isdigit() for c in ticker) and len(ticker) == 6)
         
-        # 1. 기본값 세팅 (포트폴리오에 처음 들어온 신규 종목일 경우 매수가를 임시 현재가로 사용)
+        # [안전장치 1단계] 신규 종목일 경우 일단 매수가를 임시 현재가로 세팅
         current_price = avg_price
         one_day_return = "0.00%"
         stock_name = krx_name_registry.get(ticker, ticker) if is_kr else US_STOCK_NAME_REGISTRY.get(ticker.upper(), ticker.upper())
 
-        # 2. [핵심 버그 수정] 기존 포트폴리오에 있던 종목이면, 무조건 어제 종가(기존 현재가)를 먼저 계승!
+        # [안전장치 2단계] 기존 시트에 있던 종목이라면 '어제 가격'을 1순위로 계승 (장이 다를 때를 위함)
         if ticker in old_prices:
             current_price = old_prices[ticker][0]
             one_day_return = old_prices[ticker][1]
             stock_name = old_prices[ticker][2]
 
-        # 3. 해당 장(Market) 배치일 때만 API를 찔러서 최신화 (한국장 배치일 땐 한국 종목만, 미국장일 땐 미국 종목만 덮어씀)
+        # [안전장치 3단계] 배치 조건에 맞는 장(Market)일 때만 통신을 통해 최신화!
         if (mode == "kr" and is_kr) or (mode == "us" and not is_kr) or mode == "all":
             print(f"[{ticker}] 최신 시세 동기화 중...")
-            try:
-                if is_kr:
-                    res = requests.get(f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{ticker}", timeout=5).json()
-                    item = res['result']['areas'][0]['datas'][0]
-                    current_price = float(item['nv'])
-                    one_day_return = f"{float(item['cr']):+.2f}%"
-                else: 
-                    df_stock = yf.Ticker(ticker).history(period="7d").dropna(subset=['Close'])
-                    if not df_stock.empty:
-                        current_price = float(df_stock['Close'].iloc[-1])
-                        if len(df_stock) >= 2: 
-                            prev_close = float(df_stock['Close'].iloc[-2])
-                            one_day_return = f"{((current_price - prev_close) / prev_close * 100):+.2f}%"
-            except Exception as e:
-                print(f"⚠️ [{ticker}] 시세 연동 실패: {e}")
+            fetched_price, fetched_return = fetch_safely_latest_price(ticker, is_kr)
+            
+            # API에서 유효한 가격을 가져온 경우에만 덮어씌움 (실패 시 어제 가격 유지)
+            if fetched_price is not None and fetched_price > 0:
+                current_price = fetched_price
+                one_day_return = fetched_return
+            else:
+                print(f"⚠️ [{ticker}] 가격 조회 실패. 기존 가격({current_price})을 안전하게 유지합니다.")
 
         total_value_krw = shares * current_price * (usd_krw if currency == 'USD' else 1)
         safe_ticker = f"'{ticker}" if is_kr else ticker
@@ -153,13 +183,12 @@ def run_daily_batch(mode="all"):
     if not hist_sheet.get_all_values(): hist_sheet.append_row(["Date", "Ticker", "Stock_Name", "Total_Value_KRW", "Account"])
     if history_rows: hist_sheet.append_rows(history_rows)
 
-    # 4. AI 리포트는 하루의 모든 장이 끝나는 시점(미국장 마감 = "us" 모드)에 한 번만 실행됨
     if mode in ["us", "all"]:
         portfolio_data_str = "\n".join(portfolio_text_list)
         if portfolio_data_str.strip():
             print("🚀 [AI 분석] 리포트 생성 및 텔레그램 푸시 중...")
             ai_results = {}
-            send_telegram_push(f"🔔 **오늘의 포트폴리오 AI 분석 완료! ({snapshot_date_str})**\n\n4인 4색 전문가 리포트를 차례로 전송합니다.")
+            send_telegram_push(f"🔔 **오늘의 포트폴리오 스냅샷 & AI 분석 완료! ({snapshot_date_str})**")
             
             for p, name in [("quant", "📉 퀀트"), ("macro", "🌍 매크로"), ("value", "💎 가치투자"), ("ten_bagger", "🚀 텐베거")]:
                 ai_results[p] = analyze_portfolio(portfolio_data_str, p)
